@@ -66,9 +66,7 @@ int main() {
     gpio_pull_up(I2C_SCL_PIN);
 
     display.begin();
-/*    ui_show_diag(display, display.controller_name());
-    sleep_ms(1500);
-*/
+
     input_init(twist);
     mic_init();
 
@@ -79,10 +77,11 @@ int main() {
 
     ui_init(display);
 
-	AppState state = AppState::StartupMenu;
+    AppState state      = AppState::StartupMenu;
     float    calib_ref_m  = 10.0f;
     bool     calib_done   = false;
     bool     calib_ok     = false;
+    static int menu_sel   = 0;
 
     while (true) {
         input_update();
@@ -91,7 +90,6 @@ int main() {
 
         CableProfile &prof = profiles[g_profile_index];
         tdr_set_velocity_factor(prof.vf);
-		static int menu_sel = 0;
 
         switch (state) {
         case AppState::TdrView: {
@@ -103,8 +101,9 @@ int main() {
             else
                 input_set_rgb(0, 255, 0);
 
+            // Tryk = tilbage til menu
             if (press) {
-                state = AppState::MicView;
+                state = AppState::StartupMenu;
             }
             break;
         }
@@ -119,8 +118,9 @@ int main() {
             else
                 input_set_rgb(255, 255, 0);
 
+            // Tryk = tilbage til menu
             if (press) {
-                state = AppState::MenuProfiles;
+                state = AppState::StartupMenu;
             }
             break;
         }
@@ -136,6 +136,7 @@ int main() {
             input_set_rgb(0, 0, 255);
 
             if (press) {
+                // Tryk = ind i kalibrering
                 state        = AppState::Calibrate;
                 calib_ref_m  = 10.0f;
                 calib_done   = false;
@@ -151,14 +152,15 @@ int main() {
 
             if (!calib_done && press) {
                 TdrResult r = tdr_measure();
-                calib_ok = tdr_calibrate_vf(calib_ref_m, r);
+                calib_ok   = tdr_calibrate_vf(calib_ref_m, r);
                 calib_done = true;
 
                 if (g_profile_index == 3 && calib_ok) {
                     profiles[3].vf = tdr_get_velocity_factor();
                 }
             } else if (calib_done && press) {
-                state = AppState::TdrView;
+                // Efter kalibrering: tilbage til menu
+                state = AppState::StartupMenu;
             }
 
             ui_draw_calib(calib_ref_m, calib_done, calib_ok);
@@ -167,34 +169,37 @@ int main() {
                           255);
             break;
         }
-	case AppState::StartupMenu: {
-	    if (delta != 0) {
-    	    if (delta > 0) menu_sel++;
-        	else           menu_sel--;
+        case AppState::StartupMenu: {
+            if (delta != 0) {
+                if (delta > 0) menu_sel++;
+                else           menu_sel--;
 
-        	if (menu_sel < 0) menu_sel = 0;
-        	if (menu_sel > 4) menu_sel = 4;
-    	}
+                if (menu_sel < 0) menu_sel = 0;
+                if (menu_sel > 4) menu_sel = 4;
+            }
 
-    	ui_draw_startmenu(menu_sel);
+            ui_draw_startmenu(menu_sel);
+            input_set_rgb(0, 50, 200);
 
-    	input_set_rgb(0, 50, 200); // blå-ish
-
-    	if (press) {
-        	switch (menu_sel) {
-        	case 0: state = AppState::TdrView; break;
-        	case 1: state = AppState::MicView; break;
-        	case 2: state = AppState::MenuProfiles; break;
-        	case 3: state = AppState::Calibrate; break;
-        	case 4:
-            	ui_show_diag(display, display.controller_name());
-            	sleep_ms(1500);
-            	break;
-        	}
-    	}
-    	break;
-		}
-
+            if (press) {
+                switch (menu_sel) {
+                case 0: state = AppState::TdrView;       break;
+                case 1: state = AppState::MicView;       break;
+                case 2: state = AppState::MenuProfiles;  break;
+                case 3: state = AppState::Calibrate;
+                        calib_ref_m  = 10.0f;
+                        calib_done   = false;
+                        calib_ok     = false;
+                        break;
+                case 4:
+                    ui_show_diag(display, display.controller_name());
+                    sleep_ms(1500);
+                    state = AppState::StartupMenu;
+                    break;
+                }
+            }
+            break;
+        }
         }
 
         sleep_ms(30);

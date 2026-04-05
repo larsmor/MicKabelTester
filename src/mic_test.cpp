@@ -65,12 +65,29 @@ MicResult mic_measure() {
     // --------------------------------------------------------
     // 2) Test for kortslutning mellem lederne
     // --------------------------------------------------------
-    int sum = (p1 ? 1 : 0) + (p2 ? 1 : 0) + (p3 ? 1 : 0);
+    bool short12 = false;
+    bool short13 = false;
+    bool short23 = false;
 
-    // Hvis alle tre er høje → sandsynlig kortslutning
-    if (sum >= 2) {
-        r.short_detected = true;
-    }
+    // Helper lambda til at teste en pin som output
+    auto test_output = [&](uint out_pin, uint in1, uint in2, bool &s1, bool &s2) {
+        gpio_set_dir(out_pin, GPIO_OUT);
+        gpio_put(out_pin, 1);
+        sleep_us(50);
+
+        if (gpio_get(in1)) s1 = true;
+        if (gpio_get(in2)) s2 = true;
+
+        gpio_put(out_pin, 0);
+        gpio_set_dir(out_pin, GPIO_IN);
+    };
+
+    // Test alle kombinationer
+    test_output(PIN1, PIN2, PIN3, short12, short13);
+    test_output(PIN2, PIN1, PIN3, short12, short23);
+    test_output(PIN3, PIN1, PIN2, short13, short23);
+
+    r.short_detected = short12 || short13 || short23;
 
     // --------------------------------------------------------
     // 3) Test for mikrofon-tilstedeværelse (DC-load)

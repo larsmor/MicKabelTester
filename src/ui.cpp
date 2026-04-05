@@ -1,21 +1,25 @@
 #include "ui.hpp"
+#include "gfx.hpp"
+#include "tdr.hpp"        // ← tilføj denne
+#include "mic_test.hpp"   // ← og denne
 #include <cstdio>
+#include <cstdlib>
 
 static GFX *g_disp = nullptr;
 
-// Smooth scroll state
-static int scroll_pos = 0;
+// Smooth scroll state for startmenu
+static int scroll_pos    = 0;
 static int scroll_target = 0;
 
 void ui_init(GFX &disp) {
     g_disp = &disp;
 }
 
-// Tegner tekst som "sort" ved at cleare pixels i stedet for at sætte dem
+// Sort tekst ved at cleare pixels
 void drawStringInverted(GFX &d, int x, int y, const char *s)
 {
     while (*s) {
-        d.drawChar(x, y, *s, 0);  // 0 = sort (clear)
+        d.drawChar(x, y, *s, 0);
         x += 6;
         s++;
     }
@@ -160,7 +164,7 @@ void ui_draw_startmenu(int selection)
     auto &d = *g_disp;
     d.clear();
 
-    // FAST HEADER
+    // Fast header
     d.drawString(0, 0,  "KABEL TESTER",     1);
     d.drawString(0, 10, "Select function:", 1);
 
@@ -172,36 +176,34 @@ void ui_draw_startmenu(int selection)
         "Diagnostics"
     };
 
-    // Beregn scroll_target ud fra selection
+    // Scroll-target ud fra selection
     if (selection >= 3)
         scroll_target = (selection - 2) * 10;
     else
         scroll_target = 0;
 
-    // Smooth scroll animation
+    // Smooth scroll
     if (scroll_pos < scroll_target)
         scroll_pos += 2;
     else if (scroll_pos > scroll_target)
         scroll_pos -= 2;
 
-    if (abs(scroll_pos - scroll_target) < 2)
+    if (std::abs(scroll_pos - scroll_target) < 2)
         scroll_pos = scroll_target;
 
-    // MENU STARTER VED Y = 24
+    // Menu starter ved y = 24
     for (int i = 0; i < 5; i++) {
         int y = 24 + i * 10 - scroll_pos;
 
-        // Menu må ikke tegne over headeren
+        // Tegn kun under header
         if (y < 24 || y > d.height())
             continue;
 
-        // Ryd linjen
         d.fillRect(0, y - 1, d.width(), 10, 0);
 
         if (i == selection) {
-            // Highlight-bar
             d.fillRect(0, y - 1, d.width(), 10, 1);
-            drawStringInverted(d, 4, y, items[i]); // sort tekst
+            drawStringInverted(d, 4, y, items[i]);
         } else {
             d.drawString(4, y, items[i], 1);
         }
