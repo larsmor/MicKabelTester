@@ -23,17 +23,14 @@ static uint8_t g_samples[128];
 // ------------------------------------------------------------
 // PIO-program: send puls + sample input
 // ------------------------------------------------------------
+// 0: set pins, 1   (puls HIGH)
+// 1: set pins, 0   (puls LOW)
+// 2: in pins, 1    (sample input-bit)
+// 3: jmp 2         (loop samples)
 static const uint16_t tdr_program_instructions[] = {
-    // 0: Sæt output HIGH i 1 cycle
     0xE081, // set pins, 1
-
-    // 1: Sæt output LOW
     0xE000, // set pins, 0
-
-    // 2: Læs input-pin → shift
     0x4001, // in pins, 1
-
-    // 3: Loop tilbage til 2
     0x0002  // jmp 2
 };
 
@@ -50,17 +47,34 @@ void tdr_init(const TdrConfig &cfg) {
     g_velocity_factor = cfg.velocity_factor;
     g_clkdiv          = cfg.clkdiv;
 
-    gpio_init(TDR_OUT_PIN);
-    gpio_set_dir(TDR_OUT_PIN, GPIO_OUT);
+    // Giv PIO ejerskab af pins
+    pio_gpio_init(g_pio, TDR_OUT_PIN);
+    pio_gpio_init(g_pio, TDR_IN_PIN);
 
-    gpio_init(TDR_IN_PIN);
-    gpio_set_dir(TDR_IN_PIN, GPIO_IN);
+    // Sæt pin-retninger for state machine
+    pio_sm_set_consecutive_pindirs(g_pio, g_sm, TDR_OUT_PIN, 1, true);   // OUT = output
+    pio_sm_set_consecutive_pindirs(g_pio, g_sm, TDR_IN_PIN,  1, false);  // IN  = input
 
+    // Load PIO-program
     g_offset = pio_add_program(g_pio, &tdr_program);
 
     pio_sm_config c = pio_get_default_sm_config();
-    sm_config_set_out_pins(&c, TDR_OUT_PIN, 1);
+
+    // set pins-instruktionen bruger dette
+    sm_config_set_set_pins(&c, TDR_OUT_PIN, 1);
+
+    // in pins-instruktionen bruger dette
     sm_config_set_in_pins(&c, TDR_IN_PIN);
+
+    // Shift-konfiguration:
+    //  - shift right
+    //  - autopush enable
+    //  - push efter 1 bit → ét sample pr. ord
+    sm_config_set_in_shift(&c,
+                           true,   // shift right
+                           true,   // autopush enable
+                           1);     // push ved 1 bit
+
     sm_config_set_clkdiv(&c, g_clkdiv);
 
     pio_sm_init(g_pio, g_sm, g_offset, &c);
@@ -88,19 +102,22 @@ float tdr_get_velocity_factor() {
 }
 
 // ------------------------------------------------------------
-// Mål TDR
+// Mål TDR (blocking, men deterministisk og uden deadlocks)
 // ------------------------------------------------------------
 TdrResult tdr_measure() {
-    // Ryd FIFO
+    // Ryd og restart SM
+    pio_sm_set_enabled(g_pio, g_sm, false);
     pio_sm_clear_fifos(g_pio, g_sm);
+    pio_sm_restart(g_pio, g_sm);
+    pio_sm_exec(g_pio, g_sm, (uint32_t)(0x0000 | g_offset)); // jmp offset
 
     // Start state machine
     pio_sm_set_enabled(g_pio, g_sm, true);
 
-    // Læs 128 samples
+    // Læs 128 samples (ét bit pr. ord)
     for (int i = 0; i < 128; i++) {
         uint32_t v = pio_sm_get_blocking(g_pio, g_sm);
-        g_samples[i] = (v & 1);
+        g_samples[i] = (v & 1) ? 1 : 0;
     }
 
     // Stop SM
@@ -113,6 +130,7 @@ TdrResult tdr_measure() {
     r.reflect_index = -1;
     r.distance_m    = 0.0f;
 
+    // Ignorer de første få samples (puls/settling)
     for (int i = 5; i < 128; i++) {
         if (g_samples[i] != g_samples[i - 1]) {
             r.fault_found   = true;
