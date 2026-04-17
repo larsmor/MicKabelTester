@@ -94,7 +94,7 @@ int main() {
         switch (state) {
         case AppState::TdrView: {
             TdrResult r = tdr_measure();
-            ui_draw_tdr(r, prof.name, prof.vf);
+			ui_draw_tdr(r, prof.name, prof.vf);
 
             if (r.fault_found)
                 input_set_rgb(255, 0, 0);
@@ -103,7 +103,7 @@ int main() {
 
             // Tryk = tilbage til menu
             if (press) {
-                state = AppState::StartupMenu;
+				state = AppState::StartupMenu;
             }
             break;
         }
@@ -152,6 +152,7 @@ int main() {
 
             if (!calib_done && press) {
                 TdrResult r = tdr_measure();
+				ui_show_progress("Starter...", 20);
                 calib_ok   = tdr_calibrate_vf(calib_ref_m, r);
                 calib_done = true;
 
@@ -180,8 +181,9 @@ int main() {
 
             ui_draw_startmenu(menu_sel);
             input_set_rgb(0, 50, 200);
-
+			
             if (press) {
+				ui_show_progress("Starter...", 20);
                 switch (menu_sel) {
                 case 0: state = AppState::TdrView;       break;
                 case 1: state = AppState::MicView;       break;

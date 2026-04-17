@@ -4,6 +4,8 @@
 #include "mic_test.hpp"   // ← og denne
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
+#include <pico/stdlib.h>
 
 static GFX *g_disp = nullptr;
 
@@ -210,4 +212,29 @@ void ui_draw_startmenu(int selection)
     }
 
     d.show();
+}
+
+void ui_show_progress(const char *msg, int steps)
+{
+    auto &d = *g_disp;
+
+    for (int i = 0; i <= steps; i++) {
+        d.clear();
+
+        // Tekst
+        d.drawString(0, 20, msg, 1);
+
+        // Ramme (manuelt tegnet)
+        d.drawLine(10,     40,     118, 40,     1); // top
+        d.drawLine(10,     50,     118, 50,     1); // bund
+        d.drawLine(10,     40,     10,  50,     1); // venstre
+        d.drawLine(118,    40,     118, 50,     1); // højre
+
+        // Fyld (progress)
+        int w = (i * 106) / steps;
+        d.fillRect(11, 41, w, 8, 1);
+
+        d.show();
+        sleep_ms(40);
+    }
 }

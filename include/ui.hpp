@@ -27,3 +27,5 @@ void ui_draw_calib(float ref_len_m,
 void ui_draw_startmenu(int selection);
 
 void drawStringInverted(GFX &d, int x, int y, const char *s);
+
+void ui_show_progress(const char *msg, int steps = 20);
