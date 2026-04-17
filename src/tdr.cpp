@@ -51,6 +51,9 @@ void tdr_init(const TdrConfig &cfg) {
     pio_gpio_init(g_pio, TDR_OUT_PIN);
     pio_gpio_init(g_pio, TDR_IN_PIN);
 
+    // Input skal have pull-down for at undgå flydende signaler
+    gpio_pull_down(TDR_IN_PIN);
+
     // Sæt pin-retninger for state machine
     pio_sm_set_consecutive_pindirs(g_pio, g_sm, TDR_OUT_PIN, 1, true);   // OUT = output
     pio_sm_set_consecutive_pindirs(g_pio, g_sm, TDR_IN_PIN,  1, false);  // IN  = input
@@ -102,7 +105,7 @@ float tdr_get_velocity_factor() {
 }
 
 // ------------------------------------------------------------
-// Mål TDR (blocking, men deterministisk og uden deadlocks)
+// Mål TDR (blocking, deterministisk, robust)
 // ------------------------------------------------------------
 TdrResult tdr_measure() {
     // Ryd og restart SM
@@ -123,14 +126,35 @@ TdrResult tdr_measure() {
     // Stop SM
     pio_sm_set_enabled(g_pio, g_sm, false);
 
-    // Find refleksion
+    // --------------------------------------------------------
+    // 1) "No cable detection": hvis alle samples er ens
+    // --------------------------------------------------------
+    bool all_same = true;
+    for (int i = 1; i < 128; i++) {
+        if (g_samples[i] != g_samples[0]) {
+            all_same = false;
+            break;
+        }
+    }
+
+    if (all_same) {
+        TdrResult r{};
+        r.fault_found   = true;
+        r.is_short      = false;
+        r.reflect_index = 0;
+        r.distance_m    = 0.0f;
+        return r;
+    }
+
+    // --------------------------------------------------------
+    // 2) Find refleksion (første kant)
+    // --------------------------------------------------------
     TdrResult r{};
     r.fault_found   = false;
     r.is_short      = false;
     r.reflect_index = -1;
     r.distance_m    = 0.0f;
 
-    // Ignorer de første få samples (puls/settling)
     for (int i = 5; i < 128; i++) {
         if (g_samples[i] != g_samples[i - 1]) {
             r.fault_found   = true;
@@ -140,6 +164,9 @@ TdrResult tdr_measure() {
         }
     }
 
+    // --------------------------------------------------------
+    // 3) Beregn afstand
+    // --------------------------------------------------------
     if (r.fault_found) {
         float Ts_s = tdr_get_sample_period_ns() * 1e-9f;
         float t    = r.reflect_index * Ts_s;
