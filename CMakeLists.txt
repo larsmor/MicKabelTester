@@ -38,6 +38,7 @@ add_executable(kabel_tester
 	src/tdr.cpp
 	src/twistcontroller.cpp
 	src/ui.cpp
+	src/battery.cpp
 	)
 
 pico_set_program_name(kabel_tester "kabel_tester")

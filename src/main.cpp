@@ -83,6 +83,9 @@ int main() {
     bool     calib_ok     = false;
     static int menu_sel   = 0;
 
+    // store last TDR result for UI
+    static TdrResult last_r{};
+
     while (true) {
         input_update();
         int16_t delta = input_get_delta();
@@ -92,21 +95,28 @@ int main() {
         tdr_set_velocity_factor(prof.vf);
 
         switch (state) {
+
+        // ----------------------------------------------------
+        // TDR VIEW
+        // ----------------------------------------------------
         case AppState::TdrView: {
             TdrResult r = tdr_measure();
-			ui_draw_tdr(r, prof.name, prof.vf);
+            ui_draw_tdr(r, prof.name, prof.vf);
 
             if (r.fault_found)
                 input_set_rgb(255, 0, 0);
             else
                 input_set_rgb(0, 255, 0);
 
-            // Tryk = tilbage til menu
             if (press) {
-				state = AppState::StartupMenu;
+                state = AppState::StartupMenu;
             }
             break;
         }
+
+        // ----------------------------------------------------
+        // MIC VIEW
+        // ----------------------------------------------------
         case AppState::MicView: {
             MicResult m = mic_measure();
             ui_draw_mic(m);
@@ -118,12 +128,15 @@ int main() {
             else
                 input_set_rgb(255, 255, 0);
 
-            // Tryk = tilbage til menu
             if (press) {
                 state = AppState::StartupMenu;
             }
             break;
         }
+
+        // ----------------------------------------------------
+        // PROFILE MENU
+        // ----------------------------------------------------
         case AppState::MenuProfiles: {
             if (delta != 0) {
                 if (delta > 0)
@@ -136,7 +149,6 @@ int main() {
             input_set_rgb(0, 0, 255);
 
             if (press) {
-                // Tryk = ind i kalibrering
                 state        = AppState::Calibrate;
                 calib_ref_m  = 10.0f;
                 calib_done   = false;
@@ -144,55 +156,94 @@ int main() {
             }
             break;
         }
+
+        // ----------------------------------------------------
+        // CALIBRATION (with English messages)
+        // ----------------------------------------------------
         case AppState::Calibrate: {
+
             if (!calib_done && delta != 0) {
                 calib_ref_m += (delta > 0) ? 1.0f : -1.0f;
                 if (calib_ref_m < 1.0f) calib_ref_m = 1.0f;
             }
 
             if (!calib_done && press) {
-                TdrResult r = tdr_measure();
-				ui_show_progress("Starter...", 20);
-                calib_ok   = tdr_calibrate_vf(calib_ref_m, r);
-                calib_done = true;
 
-                if (g_profile_index == 3 && calib_ok) {
-                    profiles[3].vf = tdr_get_velocity_factor();
+                TdrResult r = tdr_measure();
+                last_r = r;
+                ui_show_progress("Measuring...", 20);
+
+                if (r.reflect_index == 0) {
+                    calib_ok   = false;
+                    calib_done = true;
                 }
-            } else if (calib_done && press) {
-                // Efter kalibrering: tilbage til menu
+                else if (!r.fault_found || r.reflect_index < 0) {
+                    calib_ok   = false;
+                    calib_done = true;
+                }
+                else {
+                    calib_ok   = tdr_calibrate_vf(calib_ref_m, r);
+                    calib_done = true;
+
+                    if (g_profile_index == 3 && calib_ok) {
+                        profiles[3].vf = tdr_get_velocity_factor();
+                    }
+                }
+            }
+            else if (calib_done && press) {
                 state = AppState::StartupMenu;
             }
 
-            ui_draw_calib(calib_ref_m, calib_done, calib_ok);
-            input_set_rgb(calib_done ? (calib_ok ? 0 : 255) : 0,
-                          calib_done ? (calib_ok ? 255 : 0) : 0,
-                          255);
+            // LED feedback
+            if (calib_done) {
+                if (last_r.reflect_index == 0)
+                    input_set_rgb(255, 255, 0);   // yellow = no cable
+                else if (!calib_ok)
+                    input_set_rgb(255, 0, 0);     // red = measurement error
+                else
+                    input_set_rgb(0, 255, 0);     // green = OK
+            } else {
+                input_set_rgb(0, 0, 255);
+            }
+
+            // English status text
+            const char *msg =
+                !calib_done ? "Press: measure"
+                : (last_r.reflect_index == 0 ? "No cable connected"
+                : (!calib_ok ? "Measurement error"
+                : "Calibration OK"));
+
+            ui_draw_calib(calib_ref_m, calib_done, calib_ok, msg);
             break;
         }
+
+        // ----------------------------------------------------
+        // START MENU
+        // ----------------------------------------------------
         case AppState::StartupMenu: {
             if (delta != 0) {
                 if (delta > 0) menu_sel++;
                 else           menu_sel--;
 
-                if (menu_sel < 0) menu_sel = 0;
-                if (menu_sel > 4) menu_sel = 4;
+                if (menu_sel < 0) menu_sel = 4;
+                if (menu_sel > 4) menu_sel = 0;
             }
 
             ui_draw_startmenu(menu_sel);
             input_set_rgb(0, 50, 200);
-			
+
             if (press) {
-				ui_show_progress("Starter...", 20);
+                ui_show_progress("Starting...", 20);
                 switch (menu_sel) {
                 case 0: state = AppState::TdrView;       break;
                 case 1: state = AppState::MicView;       break;
                 case 2: state = AppState::MenuProfiles;  break;
-                case 3: state = AppState::Calibrate;
-                        calib_ref_m  = 10.0f;
-                        calib_done   = false;
-                        calib_ok     = false;
-                        break;
+                case 3:
+                    state = AppState::Calibrate;
+                    calib_ref_m  = 10.0f;
+                    calib_done   = false;
+                    calib_ok     = false;
+                    break;
                 case 4:
                     ui_show_diag(display, display.controller_name());
                     sleep_ms(1500);

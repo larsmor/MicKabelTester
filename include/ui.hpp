@@ -1,11 +1,10 @@
 #pragma once
 #include <cstdint>
 
-class GFX;
-
-// Fremad-deklarationer (ingen structs her!)
 struct TdrResult;
 struct MicResult;
+
+class GFX;
 
 void ui_init(GFX &disp);
 
@@ -22,10 +21,9 @@ void ui_draw_menu(const char *profile_name,
 
 void ui_draw_calib(float ref_len_m,
                    bool done,
-                   bool ok);
+                   bool ok,
+                   const char *status_text);
 
 void ui_draw_startmenu(int selection);
 
-void drawStringInverted(GFX &d, int x, int y, const char *s);
-
-void ui_show_progress(const char *msg, int steps = 20);
+void ui_show_progress(const char *msg, int steps);
