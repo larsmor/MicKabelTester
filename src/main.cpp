@@ -2,6 +2,7 @@
 #include <cmath>
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
+#include "hardware/adc.h"
 
 #include "oled.hpp"
 #include "TwistController.hpp"
@@ -64,6 +65,11 @@ int main() {
     gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA_PIN);
     gpio_pull_up(I2C_SCL_PIN);
+
+	// ADC init
+	adc_init();
+	adc_gpio_init(26);
+	adc_gpio_init(27);
 
     display.begin();
 

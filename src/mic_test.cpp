@@ -92,13 +92,14 @@ MicResult mic_measure() {
     // --------------------------------------------------------
     // 3) Test for mikrofon-tilstedeværelse (DC-load)
     // --------------------------------------------------------
+	adc_select_input(0);
     uint16_t raw = adc_read();      // 0–4095
     float voltage = (raw / 4095.0f) * 3.3f;
 
     // Typisk mikrofon DC-load: 1.5–2.5V
-    if (voltage > 1.0f && voltage < 3.0f) {
-        r.mic_present = true;
-    }
+    if (r.pin_ok[1] && !r.short_detected && voltage > 1.5f && voltage < 2.5f) {
+	    r.mic_present = true;
+	}
 
     return r;
 }
