@@ -4,7 +4,7 @@
 
 // Juster disse hvis din spændingsdeler er anderledes
 static const float VREF      = 3.3f;
-static const float R1        = 100000.0f;  // top resistor
+static const float R1        = 200000.0f;  // top resistor
 static const float R2        = 100000.0f;  // bottom resistor
 static const float FULL_V    = 4.20f;
 static const float EMPTY_V   = 3.20f;
