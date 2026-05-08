@@ -1,6 +1,6 @@
+#include "pico/stdlib.h"
 #include <cstdio>
 #include <cmath>
-#include "pico/stdlib.h"
 #include "hardware/i2c.h"
 #include "hardware/adc.h"
 
@@ -60,27 +60,22 @@ int main() {
     stdio_init_all();
     sleep_ms(200);
 
+    printf("Hello from Pico!\n");
+
     i2c_init(i2c0, 400000);
     gpio_set_function(I2C_SDA_PIN, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL_PIN, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA_PIN);
     gpio_pull_up(I2C_SCL_PIN);
 
-	// ADC init
-	adc_init();
-	adc_gpio_init(26);
-	adc_gpio_init(27);
+    // ADC init (global)
+    adc_init();
+    adc_gpio_init(26);
+    adc_gpio_init(27);
 
     display.begin();
 
     input_init(twist);
-    mic_init();
-
-    TdrConfig cfg{};
-    cfg.clkdiv          = 1.0f;
-    cfg.velocity_factor = profiles[0].vf;
-    tdr_init(cfg);
-
     ui_init(display);
 
     AppState state      = AppState::StartupMenu;
@@ -89,7 +84,6 @@ int main() {
     bool     calib_ok     = false;
     static int menu_sel   = 0;
 
-    // store last TDR result for UI
     static TdrResult last_r{};
 
     while (true) {
@@ -106,7 +100,8 @@ int main() {
         // TDR VIEW
         // ----------------------------------------------------
         case AppState::TdrView: {
-            TdrResult r = tdr_measure();
+            // Brug filtreret måling (eller tdr_measure_autogain())
+            TdrResult r = tdr_measure_filtered();
             ui_draw_tdr(r, prof.name, prof.vf);
 
             if (r.fault_found)
@@ -120,19 +115,26 @@ int main() {
             break;
         }
 
+
         // ----------------------------------------------------
         // MIC VIEW
         // ----------------------------------------------------
         case AppState::MicView: {
-            MicResult m = mic_measure();
+            MicResult m = mic_measure_auto();
             ui_draw_mic(m);
 
-            if (m.short_detected || !m.pin_ok[0] || !m.pin_ok[1] || !m.pin_ok[2])
-                input_set_rgb(255, 0, 0);
-            else if (m.mic_present)
-                input_set_rgb(0, 255, 0);
-            else
-                input_set_rgb(255, 255, 0);
+            if (m.mic_present) {
+                input_set_rgb(0, 255, 0);   // grøn = mic OK
+            }
+            else if (m.short_detected) {
+                input_set_rgb(255, 0, 0);   // rød = kortslutning (kun kabel-mode)
+            }
+            else if (!m.pin_ok[1]) {
+                input_set_rgb(255, 0, 0);   // rød = Pin 2 ikke forbundet
+            }
+            else {
+                input_set_rgb(255, 255, 0); // gul = ingen mic
+            }
 
             if (press) {
                 state = AppState::StartupMenu;
@@ -164,7 +166,7 @@ int main() {
         }
 
         // ----------------------------------------------------
-        // CALIBRATION (with English messages)
+        // CALIBRATION
         // ----------------------------------------------------
         case AppState::Calibrate: {
 
@@ -212,7 +214,6 @@ int main() {
                 input_set_rgb(0, 0, 255);
             }
 
-            // English status text
             const char *msg =
                 !calib_done ? "Press: measure"
                 : (last_r.reflect_index == 0 ? "No cable connected"
@@ -241,9 +242,24 @@ int main() {
             if (press) {
                 ui_show_progress("Starting...", 20);
                 switch (menu_sel) {
-                case 0: state = AppState::TdrView;       break;
-                case 1: state = AppState::MicView;       break;
-                case 2: state = AppState::MenuProfiles;  break;
+                case 0: { // TDR VIEW
+                    mic_deinit();   // sluk MIC
+                    TdrConfig cfg{};
+                    cfg.clkdiv          = 1.0f;
+                    cfg.velocity_factor = profiles[g_profile_index].vf;
+                    tdr_init(cfg);   // init TDR
+                    state = AppState::TdrView;
+                    break;
+                }
+                case 1: { // MIC VIEW
+                    tdr_deinit();   // sluk TDR
+                    mic_init();     // init MIC
+                    state = AppState::MicView;
+                    break;
+                }
+                case 2:
+                    state = AppState::MenuProfiles;
+                    break;
                 case 3:
                     state = AppState::Calibrate;
                     calib_ref_m  = 10.0f;

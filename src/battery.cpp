@@ -11,7 +11,7 @@ static const float EMPTY_V   = 3.20f;
 
 int battery_get_percent()
 {
-    adc_select_input(1); // ADC0 = GPIO26
+    adc_select_input(1); // ADC1 = GPIO27
     uint16_t raw = adc_read();
 
     float v_adc = (raw * VREF) / 4095.0f;

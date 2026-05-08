@@ -1,3 +1,4 @@
+#include "pico/stdlib.h"
 #include "tdr.hpp"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
@@ -8,7 +9,7 @@
 // ------------------------------------------------------------
 // Hardware-konfiguration
 // ------------------------------------------------------------
-static const uint TDR_OUT_PIN = 2;   // Puls ud
+static const uint TDR_OUT_PIN = 2;   // Puls ud (100 - 200 ohm i serie)
 static const uint TDR_IN_PIN  = 3;   // Refleksion ind (via comparator)
 
 static PIO  g_pio = pio0;
@@ -19,6 +20,7 @@ static float g_velocity_factor = 0.66f;
 static float g_clkdiv          = 1.0f;
 
 static uint8_t g_samples[128];
+static uint8_t g_filtered[128];
 
 // ------------------------------------------------------------
 // PIO-program: send puls + sample input
@@ -85,6 +87,24 @@ void tdr_init(const TdrConfig &cfg) {
 }
 
 // ------------------------------------------------------------
+// Deinit (sluk TDR-pins)
+// ------------------------------------------------------------
+void tdr_deinit() {
+    // Stop state machine
+    pio_sm_set_enabled(g_pio, g_sm, false);
+
+    // Frigiv pins: passive inputs med pulldown
+    gpio_init(TDR_OUT_PIN);
+    gpio_init(TDR_IN_PIN);
+
+    gpio_set_dir(TDR_OUT_PIN, GPIO_IN);
+    gpio_set_dir(TDR_IN_PIN,  GPIO_IN);
+
+    gpio_pull_down(TDR_OUT_PIN);
+    gpio_pull_down(TDR_IN_PIN);
+}
+
+// ------------------------------------------------------------
 // Sample-periode
 // ------------------------------------------------------------
 float tdr_get_sample_period_ns() {
@@ -105,7 +125,7 @@ float tdr_get_velocity_factor() {
 }
 
 // ------------------------------------------------------------
-// Mål TDR (blocking, deterministisk, robust)
+// Rå TDR-måling (uændret core)
 // ------------------------------------------------------------
 TdrResult tdr_measure() {
     // Ryd og restart SM
@@ -126,9 +146,7 @@ TdrResult tdr_measure() {
     // Stop SM
     pio_sm_set_enabled(g_pio, g_sm, false);
 
-    // --------------------------------------------------------
-    // 1) "No cable detection": hvis alle samples er ens
-    // --------------------------------------------------------
+    // "No cable detection": hvis alle samples er ens
     bool all_same = true;
     for (int i = 1; i < 128; i++) {
         if (g_samples[i] != g_samples[0]) {
@@ -146,9 +164,7 @@ TdrResult tdr_measure() {
         return r;
     }
 
-    // --------------------------------------------------------
-    // 2) Find refleksion (første kant)
-    // --------------------------------------------------------
+    // Find første kant (simpel)
     TdrResult r{};
     r.fault_found   = false;
     r.is_short      = false;
@@ -164,9 +180,6 @@ TdrResult tdr_measure() {
         }
     }
 
-    // --------------------------------------------------------
-    // 3) Beregn afstand
-    // --------------------------------------------------------
     if (r.fault_found) {
         float Ts_s = tdr_get_sample_period_ns() * 1e-9f;
         float t    = r.reflect_index * Ts_s;
@@ -176,6 +189,101 @@ TdrResult tdr_measure() {
     }
 
     return r;
+}
+
+// ------------------------------------------------------------
+// Filtering helpers
+// ------------------------------------------------------------
+static void tdr_filter_majority() {
+    g_filtered[0]   = g_samples[0];
+    g_filtered[127] = g_samples[127];
+
+    for (int i = 1; i < 127; i++) {
+        int sum = g_samples[i-1] + g_samples[i] + g_samples[i+1];
+        g_filtered[i] = (sum >= 2) ? 1 : 0;
+    }
+}
+
+static int tdr_find_reflection_plateau() {
+    for (int i = 5; i < 128; i++) {
+        if (g_filtered[i] != g_filtered[i - 1]) {
+
+            int level = g_filtered[i];
+            int len = 0;
+
+            for (int j = i; j < 128 && g_filtered[j] == level; j++)
+                len++;
+
+            if (len >= 3)   // kræv mindst 3 samples
+                return i;
+        }
+    }
+    return -1;
+}
+
+static int tdr_score_reflection() {
+    int idx = tdr_find_reflection_plateau();
+    if (idx < 0) return 0;
+
+    int level = g_filtered[idx];
+    int len = 0;
+
+    for (int j = idx; j < 128 && g_filtered[j] == level; j++)
+        len++;
+
+    return len; // plateau-længde = kvalitet
+}
+
+// ------------------------------------------------------------
+// TDR med filtering
+// ------------------------------------------------------------
+TdrResult tdr_measure_filtered() {
+    // Tag rå samples
+    TdrResult raw = tdr_measure();
+
+    // Filter samples
+    tdr_filter_majority();
+
+    // Find refleksion med plateau
+    int idx = tdr_find_reflection_plateau();
+
+    TdrResult r{};
+    r.fault_found   = (idx >= 0);
+    r.reflect_index = idx;
+    r.is_short      = (idx >= 0) ? g_filtered[idx] == 1 : false;
+
+    if (!r.fault_found)
+        return r;
+
+    float Ts_s = tdr_get_sample_period_ns() * 1e-9f;
+    float t    = r.reflect_index * Ts_s;
+    float C    = 299792458.0f;
+
+    r.distance_m = (C * g_velocity_factor * t) / 2.0f;
+    return r;
+}
+
+// ------------------------------------------------------------
+// TDR "auto-gain" (multi-sample, vælg bedste refleks)
+// ------------------------------------------------------------
+TdrResult tdr_measure_autogain() {
+    TdrResult best{};
+    int best_score = 0;
+
+    for (int i = 0; i < 8; i++) {
+        TdrResult r = tdr_measure();
+        tdr_filter_majority();
+        int score = tdr_score_reflection();
+
+        if (score > best_score) {
+            best_score = score;
+            best = r;
+        }
+
+        sleep_us(200);
+    }
+
+    return best;
 }
 
 // ------------------------------------------------------------

@@ -2,10 +2,13 @@
 #include <cstdint>
 
 struct MicResult {
-    bool pin_ok[3];        // Pin 1, 2, 3 OK?
-    bool short_detected;   // Kortslutning mellem lederne?
-    bool mic_present;      // Er der en mikrofon (DC-load)?
+    bool pin_ok[3];
+    bool short_detected;
+    bool mic_present;
+    float adc_voltage;
 };
 
 void mic_init();
-MicResult mic_measure();
+void mic_deinit();
+
+MicResult mic_measure_auto();
