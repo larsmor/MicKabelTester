@@ -27,3 +27,5 @@ void ui_draw_calib(float ref_len_m,
 void ui_draw_startmenu(int selection);
 
 void ui_show_progress(const char *msg, int steps);
+
+void ui_draw_tdr_curve(const uint8_t *samples, int n);

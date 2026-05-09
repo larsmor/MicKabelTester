@@ -27,6 +27,10 @@ void mic_init() {
     gpio_set_dir(PIN2, GPIO_IN);
     gpio_set_dir(PIN3, GPIO_IN);
 
+    gpio_pull_down(PIN1);
+    gpio_pull_down(PIN2);
+    gpio_pull_down(PIN3);
+
     gpio_set_dir(PIN_TEST_SRC, GPIO_OUT);
     gpio_put(PIN_TEST_SRC, 0);
 
@@ -35,7 +39,7 @@ void mic_init() {
 }
 
 // ------------------------------------------------------------
-// Deinit (sluk MIC-pins)
+// Deinit
 // ------------------------------------------------------------
 void mic_deinit() {
     gpio_init(PIN1);
@@ -55,7 +59,59 @@ void mic_deinit() {
 }
 
 // ------------------------------------------------------------
-// AUTO-DETECT: dynamisk + kondensator
+// Hjælpefunktion: test om en pin har forbindelse gennem kablet
+// ------------------------------------------------------------
+static bool test_pin_ok(uint drive_pin, uint sense1, uint sense2)
+{
+    gpio_set_dir(drive_pin, GPIO_OUT);
+    gpio_put(drive_pin, 1);
+    sleep_us(80);
+
+    bool ok = gpio_get(sense1) || gpio_get(sense2);
+
+    gpio_put(drive_pin, 0);
+    gpio_set_dir(drive_pin, GPIO_IN);
+    sleep_us(20);
+
+    return ok;
+}
+
+// ------------------------------------------------------------
+// Hjælpefunktion: test kortslutning mellem to pins
+// ------------------------------------------------------------
+static bool test_short_pair(uint a, uint b)
+{
+    // Nulstil begge pins
+    gpio_set_dir(a, GPIO_IN);
+    gpio_set_dir(b, GPIO_IN);
+    gpio_pull_down(a);
+    gpio_pull_down(b);
+    sleep_us(20);
+
+    // Drive A, read B
+    gpio_set_dir(a, GPIO_OUT);
+    gpio_put(a, 1);
+    sleep_us(80);
+    bool ab = gpio_get(b);
+
+    gpio_put(a, 0);
+    gpio_set_dir(a, GPIO_IN);
+    sleep_us(20);
+
+    // Drive B, read A
+    gpio_set_dir(b, GPIO_OUT);
+    gpio_put(b, 1);
+    sleep_us(80);
+    bool ba = gpio_get(a);
+
+    gpio_put(b, 0);
+    gpio_set_dir(b, GPIO_IN);
+
+    return ab || ba;
+}
+
+// ------------------------------------------------------------
+// AUTO-DETECT: dynamisk + kondensator + kabeltest
 // ------------------------------------------------------------
 MicResult mic_measure_auto() {
     MicResult r{};
@@ -77,49 +133,28 @@ MicResult mic_measure_auto() {
     bool looks_like_cond_mic = (voltage > 1.2f);
 
     // --------------------------------------------------------
-    // 2) Kabeltest (pin_ok)
+    // 2) Continuity-test (KUN gennem kablet)
     // --------------------------------------------------------
-    gpio_put(PIN_TEST_SRC, 1);
-    sleep_us(50);
-
-    r.pin_ok[0] = gpio_get(PIN1);
-    r.pin_ok[1] = gpio_get(PIN2);
-    r.pin_ok[2] = gpio_get(PIN3);
-
-    gpio_put(PIN_TEST_SRC, 0);
+    r.pin_ok[0] = test_pin_ok(PIN1, PIN2, PIN3);
+    r.pin_ok[1] = test_pin_ok(PIN2, PIN1, PIN3);
+    r.pin_ok[2] = test_pin_ok(PIN3, PIN1, PIN2);
 
     // --------------------------------------------------------
     // 3) Kortslutningstest
     // --------------------------------------------------------
-    bool short12 = false;
-    bool short13 = false;
-    bool short23 = false;
+    bool short12 = test_short_pair(PIN1, PIN2);
+    bool short13 = test_short_pair(PIN1, PIN3);
+    bool short23 = test_short_pair(PIN2, PIN3);
 
-    auto test_output = [&](uint out_pin, uint in1, uint in2, bool &s1, bool &s2) {
-        gpio_set_dir(out_pin, GPIO_OUT);
-        gpio_put(out_pin, 1);
-        sleep_us(50);
-
-        if (gpio_get(in1)) s1 = true;
-        if (gpio_get(in2)) s2 = true;
-
-        gpio_put(out_pin, 0);
-        gpio_set_dir(out_pin, GPIO_IN);
-    };
-
-    test_output(PIN1, PIN2, PIN3, short12, short13);
-    test_output(PIN2, PIN1, PIN3, short12, short23);
-    test_output(PIN3, PIN1, PIN2, short13, short23);
+    r.short_detected = short12 || short13 || short23;
 
     // --------------------------------------------------------
-    // 4) Dynamisk mic-detektion (din mikrofon)
+    // 4) Dynamisk mic-detektion
     // --------------------------------------------------------
     bool looks_like_dyn_mic =
-        (voltage < 0.3f) &&       // ingen DC-load
-        r.pin_ok[0] &&            // alle pins reagerer
-        r.pin_ok[1] &&
-        r.pin_ok[2] &&
-        short12 && short13 && short23;  // alle tre shorts
+        (voltage < 0.3f) &&
+        r.pin_ok[0] && r.pin_ok[1] && r.pin_ok[2] &&
+        short12 && short13 && short23;
 
     // --------------------------------------------------------
     // 5) MIC-DETEKTION
@@ -130,15 +165,13 @@ MicResult mic_measure_auto() {
         return r;
     }
 
-    // Debug
-    printf("short12=%d short13=%d short23=%d pin1=%d pin2=%d pin3=%d ADC=%.3f\n",
-           short12, short13, short23,
+    // --------------------------------------------------------
+    // 6) Debug (valgfrit)
+    // --------------------------------------------------------
+    printf("P1=%d P2=%d P3=%d  S12=%d S13=%d S23=%d  ADC=%.3f\n",
            r.pin_ok[0], r.pin_ok[1], r.pin_ok[2],
+           short12, short13, short23,
            r.adc_voltage);
 
-    // --------------------------------------------------------
-    // 6) KABEL / FEJL
-    // --------------------------------------------------------
-    r.short_detected = short12 || short13 || short23;
     return r;
 }

@@ -292,3 +292,21 @@ void ui_show_progress(const char *msg, int steps)
         sleep_ms(40);
     }
 }
+
+void ui_draw_tdr_curve(const uint8_t *samples, int n)
+{
+	auto &d = *g_disp;
+
+    d.clear();
+
+    // Tegn baseline midt på skærmen
+    int baseline = d.height() / 2;
+
+    for (int x = 0; x < n && x < d.width(); x++) {
+        int y = samples[x] ? baseline - 20 : baseline + 20;
+        d.drawPixel(x, y, 1);
+    }
+
+    d.drawString(0, 0, "TDR Curve", 1);
+    d.show();
+}
