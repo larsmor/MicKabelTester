@@ -22,9 +22,12 @@ void ui_draw_menu(const char *profile_name,
 void ui_draw_calib(float ref_len_m,
                    bool done,
                    bool ok,
-                   const char *status_text);
+                   const char *status_line1,
+                   const char *status_line2);
 
 void ui_draw_startmenu(int selection);
+
+void ui_draw_settingsmenu(int selection);
 
 void ui_show_progress(const char *msg, int steps);
 

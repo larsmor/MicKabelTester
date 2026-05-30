@@ -10,6 +10,10 @@
 
 static GFX *g_disp = nullptr;
 
+// 7px font; hold text within 64px (y 0..56)
+static constexpr int UI_LINE = 8;
+static int ui_y(int line) { return line * UI_LINE; }
+
 // Smooth scroll state for startmenu
 static int scroll_pos    = 0;
 static int scroll_target = 0;
@@ -61,6 +65,141 @@ void ui_draw_battery(int percent)
 }
 
 // ------------------------------------------------------------
+// OLED TDR GRAPH
+// ------------------------------------------------------------
+void ui_draw_tdr_graph(GFX &d,
+                       const uint8_t *raw,
+                       const uint8_t *flt,
+                       int n,
+                       const TdrResult &r)
+{
+    TdrResult show = r;
+    if (show.fault_found && !show.is_short && !show.no_cable &&
+        show.distance_m < 0.5f) {
+        show.unstable    = true;
+        show.fault_found = false;
+    } else if (show.no_cable) {
+        show.fault_found = false;
+        show.unstable    = false;
+        show.distance_m  = 0.0f;
+        show.reflect_index = -1;
+    }
+
+    d.clear();
+
+    const int gx = 0;
+    const int gy = 16;
+    const int gw = d.width();
+    const int gh = ui_y(7) - gy;
+
+    gfx_drawRect(d, gx, gy, gw - 1, gh - 1, 1);
+
+    auto mapX = [&](int i) {
+        if (n <= 1) return gx;
+        return gx + (i * (gw - 1)) / (n - 1);
+    };
+
+    auto mapY = [&](int v) {
+        return gy + gh - 1 - (v ? (gh - 2) : 0);
+    };
+
+    // RAW (tynd, midt i båndet)
+    for (int i = 1; i < n; i++) {
+        int y0 = mapY(raw[i - 1]) - 2;
+        int y1 = mapY(raw[i]) - 2;
+        d.drawLine(mapX(i - 1), y0, mapX(i), y1, 1);
+    }
+
+    // FILTERED (tyk, fuld højde)
+    for (int i = 1; i < n; i++) {
+        int y0 = mapY(flt[i - 1]);
+        int y1 = mapY(flt[i]);
+        d.drawLine(mapX(i - 1), y0, mapX(i), y1, 1);
+        if (y0 + 1 < gy + gh - 1 && y1 + 1 < gy + gh - 1)
+            d.drawLine(mapX(i - 1), y0 + 1, mapX(i), y1 + 1, 1);
+    }
+
+    if (show.fault_found && show.reflect_index > 0 && show.reflect_index < n) {
+        int x = mapX(show.reflect_index);
+        d.drawLine(x, gy, x, gy + gh - 1, 1);
+
+        char buf[32];
+        if (show.unstable)
+            snprintf(buf, sizeof(buf), "~%.1fm?", show.distance_m);
+        else
+            snprintf(buf, sizeof(buf), "%.1fm", show.distance_m);
+        d.drawString(0, 0, buf, 1);
+
+        if (show.unstable)
+            d.drawString(72, 0, "Unstable", 1);
+        else
+            d.drawString(72, 0, show.is_short ? "SHORT" : "OPEN", 1);
+    } else if (show.no_cable) {
+        d.drawString(0, 0, "No cable", 1);
+    } else if (show.weak_signal) {
+        d.drawString(0, 0, "Weak signal", 1);
+        d.drawString(0, 8, "No reflection", 1);
+    } else if (show.unstable) {
+        d.drawString(0, 0, "Unstable", 1);
+        d.drawString(0, 8, "Retry measure", 1);
+    } else {
+        int ones = 0;
+        for (int i = 0; i < n; i++)
+            if (flt[i]) ones++;
+        int raw_ones = 0;
+        for (int i = 0; i < n; i++)
+            if (raw[i]) raw_ones++;
+        if (raw_ones == 0) {
+            if (show.diag == TDR_DIAG_GP23_OK) {
+                d.drawString(0, 0, "GP2-GP3 path OK", 1);
+                d.drawString(0, 8, "Capture fail", 1);
+            } else if (show.diag == TDR_DIAG_GP23_OPEN) {
+                d.drawString(0, 0, "No signal LO", 1);
+                d.drawString(0, 8, "Pin 5-6 open", 1);
+            } else if (show.diag == TDR_DIAG_GP3_STUCK) {
+                d.drawString(0, 0, "No TDR path", 1);
+                d.drawString(0, 8, "6pin 4-6 open", 1);
+            } else {
+                bool varies = false;
+                for (int i = 1; i < n; i++) {
+                    if (raw[i] != raw[0]) {
+                        varies = true;
+                        break;
+                    }
+                }
+                if (varies) {
+                    d.drawString(0, 0, "Weak signal", 1);
+                    d.drawString(0, 8, "No reflection", 1);
+                } else {
+                    d.drawString(0, 0, "No signal LO", 1);
+                    d.drawString(0, 8, "Capture fail", 1);
+                }
+            }
+        }
+        else if (raw_ones == n) {
+            d.drawString(0, 0, "No signal HI", 1);
+            d.drawString(0, 8, "GP3 stuck?", 1);
+        }
+        else
+            d.drawString(0, 0, "No cable", 1);
+    }
+
+    const bool show_vote_debug =
+        show.unstable && show.vote_median_delta > 0;
+    if (show_vote_debug) {
+        char dbg[22];
+        snprintf(dbg, sizeof(dbg), "md=%u so=%u sh=%u",
+                 (unsigned)show.vote_median_delta,
+                 (unsigned)show.vote_strong_open,
+                 (unsigned)show.vote_short);
+        d.drawString(0, ui_y(7), dbg, 1);
+    }
+
+    ui_draw_battery(battery_get_percent());
+    d.show();
+}
+
+// ------------------------------------------------------------
 // Inverted text helper
 // ------------------------------------------------------------
 void drawStringInverted(GFX &d, int x, int y, const char *s)
@@ -94,43 +233,12 @@ void ui_draw_tdr(const TdrResult &r,
                  float vf)
 {
     auto &d = *g_disp;
-    d.clear();
-
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "TDR %s", profile_name);
-    d.drawString(0, 0, buf, 1);
 
     int n;
-    const uint8_t *samples = tdr_get_samples(n);
+    const uint8_t *raw = tdr_get_samples(n);
+    const uint8_t *flt = tdr_get_filtered(n);
 
-    const int max_x = (n < 128) ? n : 128;
-    const int y_mid = 32;
-    const int amp   = 12;
-
-    int prev_y = y_mid - (samples[0] ? amp : -amp);
-
-    for (int x = 1; x < max_x; x++) {
-        int y = y_mid - (samples[x] ? amp : -amp);
-        d.drawLine(x - 1, prev_y, x, y, 1);
-        prev_y = y;
-    }
-
-    if (r.fault_found && r.reflect_index < max_x) {
-        int xr = r.reflect_index;
-        d.drawLine(xr, y_mid - amp - 2, xr, y_mid + amp + 2, 1);
-    }
-
-    if (r.fault_found) {
-        std::snprintf(buf, sizeof(buf), "%s %.1fm",
-                      r.is_short ? "Short" : "Open",
-                      r.distance_m);
-    } else {
-        std::snprintf(buf, sizeof(buf), "No clear fault");
-    }
-    d.drawString(0, 52, buf, 1);
-
-    ui_draw_battery(battery_get_percent());
-    d.show();
+    ui_draw_tdr_graph(d, raw, flt, n, r);
 }
 
 // ------------------------------------------------------------
@@ -141,23 +249,23 @@ void ui_draw_mic(const MicResult &m)
     auto &d = *g_disp;
     d.clear();
 
-    d.drawString(0, 0, "MIC CABLE TEST", 1);
+    d.drawString(0, ui_y(0), "MIC TEST", 1);
 
     char buf[32];
-    std::snprintf(buf, sizeof(buf), "Pin1: %s", m.pin_ok[0] ? "OK" : "OPEN");
-    d.drawString(0, 16, buf, 1);
+    std::snprintf(buf, sizeof(buf), "P1:%s", m.pin_ok[0] ? "OK" : "OPEN");
+    d.drawString(0, ui_y(1), buf, 1);
 
-    std::snprintf(buf, sizeof(buf), "Pin2: %s", m.pin_ok[1] ? "OK" : "OPEN");
-    d.drawString(0, 26, buf, 1);
+    std::snprintf(buf, sizeof(buf), "P2:%s", m.pin_ok[1] ? "OK" : "OPEN");
+    d.drawString(0, ui_y(2), buf, 1);
 
-    std::snprintf(buf, sizeof(buf), "Pin3: %s", m.pin_ok[2] ? "OK" : "OPEN");
-    d.drawString(0, 36, buf, 1);
+    std::snprintf(buf, sizeof(buf), "P3:%s", m.pin_ok[2] ? "OK" : "OPEN");
+    d.drawString(0, ui_y(3), buf, 1);
 
-    std::snprintf(buf, sizeof(buf), "Short: %s", m.short_detected ? "YES" : "NO");
-    d.drawString(0, 46, buf, 1);
+    std::snprintf(buf, sizeof(buf), "Sh:%s", m.short_detected ? "YES" : "NO");
+    d.drawString(0, ui_y(4), buf, 1);
 
-    std::snprintf(buf, sizeof(buf), "Mic: %s", m.mic_present ? "Present" : "None");
-    d.drawString(0, 56, buf, 1);
+    std::snprintf(buf, sizeof(buf), "Mic:%s", m.mic_present ? "YES" : "NO");
+    d.drawString(0, ui_y(5), buf, 1);
 
     ui_draw_battery(battery_get_percent());
     d.show();
@@ -172,15 +280,15 @@ void ui_draw_menu(const char *profile_name,
     auto &d = *g_disp;
     d.clear();
 
-    d.drawString(0, 0, "Profile:", 1);
-    d.drawString(0, 12, profile_name, 1);
+    d.drawString(0, ui_y(0), "Profile:", 1);
+    d.drawString(0, ui_y(1), profile_name, 1);
 
     char buf[32];
     std::snprintf(buf, sizeof(buf), "vf=%.3f", vf);
-    d.drawString(0, 24, buf, 1);
+    d.drawString(0, ui_y(2), buf, 1);
 
-    d.drawString(0, 40, "Turn: next", 1);
-    d.drawString(0, 52, "Press: calibrate", 1);
+    d.drawString(0, ui_y(5), "Turn: next", 1);
+    d.drawString(0, ui_y(6), "Press: back", 1);
 
     ui_draw_battery(battery_get_percent());
     d.show();
@@ -192,23 +300,28 @@ void ui_draw_menu(const char *profile_name,
 void ui_draw_calib(float ref_len_m,
                    bool done,
                    bool ok,
-                   const char *status_text)
+                   const char *status_line1,
+                   const char *status_line2)
 {
     auto &d = *g_disp;
     d.clear();
 
-    d.drawString(0, 0, "Calibration", 1);
+    d.drawString(0, ui_y(0), "Calibration", 1);
 
-    char buf[32];
+    char buf[24];
     std::snprintf(buf, sizeof(buf), "Ref: %.1fm", ref_len_m);
-    d.drawString(0, 16, buf, 1);
+    d.drawString(0, ui_y(1), buf, 1);
 
     if (!done) {
-        d.drawString(0, 32, "Press: measure", 1);
-        d.drawString(0, 44, "Turn: +/-1m", 1);
+        d.drawString(0, ui_y(2), "Match cable len", 1);
+        d.drawString(0, ui_y(3), "Press: measure", 1);
+        d.drawString(0, ui_y(4), "Turn: +/-1m Ref", 1);
     } else {
-        d.drawString(0, 32, status_text, 1);
-        d.drawString(0, 44, "Press: back", 1);
+        if (status_line1 && status_line1[0])
+            d.drawString(0, ui_y(3), status_line1, 1);
+        if (status_line2 && status_line2[0])
+            d.drawString(0, ui_y(4), status_line2, 1);
+        d.drawString(0, ui_y(6), "Press: back", 1);
     }
 
     ui_draw_battery(battery_get_percent());
@@ -223,38 +336,82 @@ void ui_draw_startmenu(int selection)
     auto &d = *g_disp;
     d.clear();
 
-    d.drawString(0, 0,  "CABLE TESTER", 1);
-    d.drawString(0, 10, "Select function:", 1);
+    d.drawString(0, ui_y(0), "CABLE TESTER", 1);
+    d.drawString(0, ui_y(1), "Select:", 1);
 
     const char *items[] = {
         "TDR measurement",
         "MIC test",
-        "Profiles",
-        "Calibration",
-        "Diagnostics"
+        "Settings"
     };
 
-    // Scroll target logic
-    if (selection >= 3)
-        scroll_target = (selection - 2) * 10;
-    else
+    const int item_count = 3;
+    const int menu_top = ui_y(2);
+    const int menu_bottom = ui_y(6);
+    const int visible_lines = (menu_bottom - menu_top) / UI_LINE + 1;
+    const bool scroll_enabled = item_count > visible_lines;
+
+    int scroll_offset = 0;
+    if (scroll_enabled) {
+        if (selection >= visible_lines - 1)
+            scroll_target = (selection - (visible_lines - 2)) * UI_LINE;
+        else
+            scroll_target = 0;
+
+        if (scroll_pos < scroll_target)
+            scroll_pos += 2;
+        else if (scroll_pos > scroll_target)
+            scroll_pos -= 2;
+
+        if (abs(scroll_pos - scroll_target) < 2)
+            scroll_pos = scroll_target;
+
+        scroll_offset = scroll_pos;
+    } else {
+        scroll_pos = 0;
         scroll_target = 0;
+    }
 
-    // Smooth scroll
-    if (scroll_pos < scroll_target)
-        scroll_pos += 2;
-    else if (scroll_pos > scroll_target)
-        scroll_pos -= 2;
+    for (int i = 0; i < item_count; i++) {
+        int y = menu_top + i * UI_LINE - scroll_offset;
 
-    if (abs(scroll_pos - scroll_target) < 2)
-        scroll_pos = scroll_target;
-
-    // Draw items
-    for (int i = 0; i < 5; i++) {
-        int y = 24 + i * 10 - scroll_pos;
-
-        if (y < 24 || y > d.height())
+        if (y < menu_top || y > ui_y(6))
             continue;
+
+        if (i == selection) {
+            gfx_fillRect(d, 0, y - 1, d.width(), 10, 1);
+            drawStringInverted(d, 4, y, items[i]);
+        } else {
+            d.drawString(4, y, items[i], 1);
+        }
+    }
+
+    ui_draw_battery(battery_get_percent());
+    d.show();
+}
+
+// ------------------------------------------------------------
+// SETTINGS MENU
+// ------------------------------------------------------------
+void ui_draw_settingsmenu(int selection)
+{
+    auto &d = *g_disp;
+    d.clear();
+
+    d.drawString(0, ui_y(0), "Settings", 1);
+    d.drawString(0, ui_y(1), "Select:", 1);
+
+    const char *items[] = {
+        "Profiles",
+        "Calibration",
+        "Back"
+    };
+
+    const int item_count = 3;
+    const int menu_top = ui_y(2);
+
+    for (int i = 0; i < item_count; i++) {
+        int y = menu_top + i * UI_LINE;
 
         if (i == selection) {
             gfx_fillRect(d, 0, y - 1, d.width(), 10, 1);

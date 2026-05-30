@@ -31,6 +31,11 @@ project(kabel_tester C CXX ASM)
 
 pico_sdk_init()
 
+# TDR USB serial debug (115200): one line per tdr_measure_stable in TDR view
+option(TDR_DEBUG "Enable TDR USB serial debug prints" OFF)
+# Calibration USB serial debug (115200): one line per calibrate measure (also on when TDR_DEBUG=ON)
+option(CALIB_DEBUG "Enable calibration USB serial debug prints" OFF)
+
 add_executable(kabel_tester 
     src/main.cpp
 	src/input.cpp
@@ -39,6 +44,7 @@ add_executable(kabel_tester
 	src/twistcontroller.cpp
 	src/ui.cpp
 	src/battery.cpp
+	src/settings_store.cpp
 	)
 
 pico_set_program_name(kabel_tester "kabel_tester")
@@ -53,10 +59,18 @@ target_link_libraries(kabel_tester
     hardware_i2c
     hardware_pio
     hardware_clocks
+    hardware_flash
 )
 
 target_include_directories(kabel_tester PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/include
 )
+
+if(TDR_DEBUG)
+    target_compile_definitions(kabel_tester PRIVATE TDR_DEBUG=1)
+endif()
+if(CALIB_DEBUG OR TDR_DEBUG)
+    target_compile_definitions(kabel_tester PRIVATE CALIB_DEBUG=1)
+endif()
 
 pico_add_extra_outputs(kabel_tester)
