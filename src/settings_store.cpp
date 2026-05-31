@@ -103,3 +103,51 @@ bool settings_save(int profile_index, const float vf[SETTINGS_PROFILE_COUNT]) {
 
     return true;
 }
+
+static bool settings_sector_empty(const SettingsBlob &blob) {
+    const auto *raw = reinterpret_cast<const uint8_t *>(&blob);
+    for (size_t i = 0; i < sizeof(SettingsBlob); i++) {
+        if (raw[i] != 0xffu)
+            return false;
+    }
+    return true;
+}
+
+SettingsFlashStatus settings_verify_flash() {
+    const auto *flash_blob =
+        reinterpret_cast<const SettingsBlob *>(XIP_BASE + SETTINGS_FLASH_OFFSET);
+
+    if (settings_sector_empty(*flash_blob))
+        return SettingsFlashStatus::Empty;
+
+    if (flash_blob->magic != SETTINGS_MAGIC)
+        return SettingsFlashStatus::BadMagic;
+
+    if (flash_blob->version != SETTINGS_VERSION)
+        return SettingsFlashStatus::BadData;
+
+    SettingsBlob tmp = *flash_blob;
+    tmp.crc32        = 0;
+    uint32_t expect  = settings_crc32(reinterpret_cast<const uint8_t *>(&tmp),
+                                      sizeof(tmp));
+    if (flash_blob->crc32 != expect)
+        return SettingsFlashStatus::BadCrc;
+
+    if (flash_blob->profile_index < 0 ||
+        flash_blob->profile_index >= SETTINGS_PROFILE_COUNT)
+        return SettingsFlashStatus::BadData;
+
+    for (int i = 0; i < SETTINGS_PROFILE_COUNT; i++) {
+        if (!settings_vf_sane(flash_blob->vf[i]))
+            return SettingsFlashStatus::BadData;
+    }
+
+    return SettingsFlashStatus::Ok;
+}
+
+bool settings_factory_reset() {
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(SETTINGS_FLASH_OFFSET, FLASH_SECTOR_SIZE);
+    restore_interrupts(ints);
+    return true;
+}

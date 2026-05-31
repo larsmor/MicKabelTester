@@ -50,13 +50,49 @@ static void profiles_save_to_flash() {
         printf("Settings saved to flash\n");
 }
 
+static void profiles_restore_defaults() {
+    profiles[0].vf = 0.66f;
+    profiles[1].vf = 0.70f;
+    profiles[2].vf = 0.78f;
+    profiles[3].vf = 0.72f;
+    g_profile_index = 0;
+}
+
+static void flash_status_message(char *line1, size_t n1,
+                                 char *line2, size_t n2,
+                                 SettingsFlashStatus st) {
+    line2[0] = '\0';
+
+    switch (st) {
+    case SettingsFlashStatus::Ok:
+        std::snprintf(line1, n1, "Flash OK");
+        std::snprintf(line2, n2, "Data valid");
+        break;
+    case SettingsFlashStatus::Empty:
+        std::snprintf(line1, n1, "Flash empty");
+        std::snprintf(line2, n2, "Defaults in use");
+        break;
+    case SettingsFlashStatus::BadMagic:
+        std::snprintf(line1, n1, "Invalid magic");
+        break;
+    case SettingsFlashStatus::BadCrc:
+        std::snprintf(line1, n1, "CRC error");
+        break;
+    case SettingsFlashStatus::BadData:
+        std::snprintf(line1, n1, "Bad data");
+        break;
+    }
+}
+
 enum class AppState {
     StartupMenu,
     SettingsMenu,
     TdrView,
     MicView,
     MenuProfiles,
-    Calibrate
+    Calibrate,
+    FactoryReset,
+    VerifyFlash
 };
 
 static void tdr_start_for_profile(const CableProfile &prof) {
@@ -191,10 +227,18 @@ int main() {
     bool     calib_ok     = false;
     static int menu_sel      = 0;
     static int settings_sel  = 0;
+    static int confirm_sel   = 0;
 
     static TdrResult last_r{};
     static char      calib_line1[22];
     static char      calib_line2[22];
+    static char      msg_line1[22];
+    static char      msg_line2[22];
+
+    enum class FactoryResetPhase { Confirm, Result };
+    static FactoryResetPhase factory_reset_phase = FactoryResetPhase::Confirm;
+    static bool              factory_reset_ok      = false;
+    static SettingsFlashStatus flash_verify_status = SettingsFlashStatus::Empty;
 
     while (true) {
         input_update();
@@ -467,8 +511,8 @@ int main() {
                 if (delta > 0) settings_sel++;
                 else           settings_sel--;
 
-                if (settings_sel < 0) settings_sel = 2;
-                if (settings_sel > 2) settings_sel = 0;
+                if (settings_sel < 0) settings_sel = 4;
+                if (settings_sel > 4) settings_sel = 0;
             }
 
             ui_draw_settingsmenu(settings_sel);
@@ -491,11 +535,78 @@ int main() {
                     break;
                 }
                 case 2:
+                    confirm_sel = 0;
+                    factory_reset_phase = FactoryResetPhase::Confirm;
+                    state = AppState::FactoryReset;
+                    break;
+                case 3:
+                    flash_verify_status = settings_verify_flash();
+                    flash_status_message(msg_line1, sizeof(msg_line1),
+                                         msg_line2, sizeof(msg_line2),
+                                         flash_verify_status);
+                    state = AppState::VerifyFlash;
+                    break;
+                case 4:
                     menu_sel = 2;
                     state = AppState::StartupMenu;
                     break;
                 }
             }
+            break;
+        }
+
+        case AppState::FactoryReset: {
+            if (factory_reset_phase == FactoryResetPhase::Confirm) {
+                if (delta != 0) {
+                    if (delta > 0) confirm_sel++;
+                    else           confirm_sel--;
+
+                    if (confirm_sel < 0) confirm_sel = 1;
+                    if (confirm_sel > 1) confirm_sel = 0;
+                }
+
+                ui_draw_confirm(confirm_sel, "Factory reset",
+                                "Reset all settings?");
+                input_set_rgb(255, 128, 0);
+
+                if (press) {
+                    if (confirm_sel == 0) {
+                        factory_reset_ok = settings_factory_reset();
+                        if (factory_reset_ok)
+                            profiles_restore_defaults();
+                        std::snprintf(msg_line1, sizeof(msg_line1),
+                                      factory_reset_ok ? "Reset OK" : "Reset failed");
+                        msg_line2[0] = '\0';
+                        factory_reset_phase = FactoryResetPhase::Result;
+                    } else {
+                        state = AppState::SettingsMenu;
+                    }
+                }
+            } else {
+                ui_draw_message("Factory reset", msg_line1, msg_line2);
+                input_set_rgb(factory_reset_ok ? 0 : 255,
+                              factory_reset_ok ? 255 : 0,
+                              0);
+
+                if (press) {
+                    factory_reset_phase = FactoryResetPhase::Confirm;
+                    state = AppState::SettingsMenu;
+                }
+            }
+            break;
+        }
+
+        case AppState::VerifyFlash: {
+            ui_draw_message("Verify flash", msg_line1, msg_line2);
+            if (flash_verify_status == SettingsFlashStatus::Ok)
+                input_set_rgb(0, 255, 0);
+            else if (flash_verify_status == SettingsFlashStatus::Empty)
+                input_set_rgb(255, 255, 0);
+            else
+                input_set_rgb(255, 0, 0);
+
+            if (press)
+                state = AppState::SettingsMenu;
             break;
         }
 

@@ -404,10 +404,12 @@ void ui_draw_settingsmenu(int selection)
     const char *items[] = {
         "Profiles",
         "Calibration",
+        "Factory reset",
+        "Verify flash",
         "Back"
     };
 
-    const int item_count = 3;
+    const int item_count = 5;
     const int menu_top = ui_y(2);
 
     for (int i = 0; i < item_count; i++) {
@@ -420,6 +422,60 @@ void ui_draw_settingsmenu(int selection)
             d.drawString(4, y, items[i], 1);
         }
     }
+
+    ui_draw_battery(battery_get_percent());
+    d.show();
+}
+
+// ------------------------------------------------------------
+// CONFIRM / MESSAGE
+// ------------------------------------------------------------
+void ui_draw_confirm(int selection,
+                     const char *title,
+                     const char *msg)
+{
+    auto &d = *g_disp;
+    d.clear();
+
+    d.drawString(0, ui_y(0), title, 1);
+    if (msg && msg[0])
+        d.drawString(0, ui_y(1), msg, 1);
+
+    const char *items[] = { "Yes", "No" };
+    const int menu_top = ui_y(4);
+
+    for (int i = 0; i < 2; i++) {
+        int y = menu_top + i * UI_LINE;
+
+        if (i == selection) {
+            gfx_fillRect(d, 0, y - 1, d.width(), 10, 1);
+            drawStringInverted(d, 4, y, items[i]);
+        } else {
+            d.drawString(4, y, items[i], 1);
+        }
+    }
+
+    d.drawString(0, ui_y(6), "Turn: select", 1);
+
+    ui_draw_battery(battery_get_percent());
+    d.show();
+}
+
+void ui_draw_message(const char *title,
+                     const char *line1,
+                     const char *line2)
+{
+    auto &d = *g_disp;
+    d.clear();
+
+    if (title && title[0])
+        d.drawString(0, ui_y(0), title, 1);
+    if (line1 && line1[0])
+        d.drawString(0, ui_y(2), line1, 1);
+    if (line2 && line2[0])
+        d.drawString(0, ui_y(3), line2, 1);
+
+    d.drawString(0, ui_y(6), "Press: back", 1);
 
     ui_draw_battery(battery_get_percent());
     d.show();

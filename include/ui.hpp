@@ -29,6 +29,14 @@ void ui_draw_startmenu(int selection);
 
 void ui_draw_settingsmenu(int selection);
 
+void ui_draw_confirm(int selection,
+                     const char *title,
+                     const char *msg);
+
+void ui_draw_message(const char *title,
+                     const char *line1,
+                     const char *line2);
+
 void ui_show_progress(const char *msg, int steps);
 
 void ui_draw_tdr_curve(const uint8_t *samples, int n);
