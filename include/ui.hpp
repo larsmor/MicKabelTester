@@ -19,7 +19,10 @@ void ui_draw_mic(const MicResult &m);
 void ui_draw_menu(const char *profile_name,
                   float vf);
 
-void ui_draw_calib(float ref_len_m,
+void ui_draw_calib_menu(int selection);
+
+void ui_draw_calib(int calib_type,
+                   float ref_len_m,
                    bool done,
                    bool ok,
                    const char *status_line1,

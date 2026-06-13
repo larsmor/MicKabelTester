@@ -14,13 +14,25 @@
 #define SETTINGS_FLASH_OFFSET (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 
 #define SETTINGS_MAGIC   0x4B544553u  // "KTES"
-#define SETTINGS_VERSION 1u
+#define SETTINGS_VERSION 2u
+
+struct SettingsBlobV1 {
+    uint32_t magic;
+    uint32_t version;
+    int32_t  profile_index;
+    float    vf[SETTINGS_PROFILE_COUNT];
+    uint32_t crc32;
+};
 
 struct SettingsBlob {
     uint32_t magic;
     uint32_t version;
     int32_t  profile_index;
     float    vf[SETTINGS_PROFILE_COUNT];
+    int8_t   short_zero_delta;
+    int8_t   load100_delta;
+    uint8_t  cal_flags;
+    uint8_t  reserved;
     uint32_t crc32;
 };
 
@@ -36,7 +48,9 @@ static uint32_t settings_crc32(const uint8_t *data, size_t len) {
 }
 
 static bool settings_blob_valid(const SettingsBlob &blob) {
-    if (blob.magic != SETTINGS_MAGIC || blob.version != SETTINGS_VERSION)
+    if (blob.magic != SETTINGS_MAGIC)
+        return false;
+    if (blob.version != SETTINGS_VERSION)
         return false;
 
     SettingsBlob tmp = blob;
@@ -46,34 +60,107 @@ static bool settings_blob_valid(const SettingsBlob &blob) {
     return blob.crc32 == expect;
 }
 
+static bool settings_blob_v1_valid(const SettingsBlobV1 &blob) {
+    if (blob.magic != SETTINGS_MAGIC || blob.version != 1u)
+        return false;
+
+    SettingsBlobV1 tmp = blob;
+    tmp.crc32          = 0;
+    uint32_t expect    = settings_crc32(reinterpret_cast<const uint8_t *>(&tmp),
+                                        sizeof(tmp));
+    return blob.crc32 == expect;
+}
+
 static bool settings_vf_sane(float vf) {
     return vf > 0.4f && vf < 0.9f;
 }
 
-bool settings_load(int *profile_index, float vf[SETTINGS_PROFILE_COUNT]) {
+static bool settings_cal_sane(const SettingsBlob &blob) {
+    if (blob.short_zero_delta < -1 || blob.short_zero_delta > 3)
+        return false;
+    if (blob.load100_delta < -1 || blob.load100_delta > 12)
+        return false;
+    if ((blob.cal_flags & SETTINGS_CAL_SHORT_VALID) &&
+        blob.short_zero_delta < 0)
+        return false;
+    if ((blob.cal_flags & SETTINGS_CAL_LOAD_VALID) &&
+        blob.load100_delta < 0)
+        return false;
+    return true;
+}
+
+static void settings_cal_defaults(SettingsCalibration &cal) {
+    cal.short_zero_delta = -1;
+    cal.load100_delta    = -1;
+    cal.flags            = 0;
+}
+
+static void settings_cal_from_blob(const SettingsBlob &blob,
+                                   SettingsCalibration &cal) {
+    settings_cal_defaults(cal);
+    cal.short_zero_delta = blob.short_zero_delta;
+    cal.load100_delta    = blob.load100_delta;
+    cal.flags            = blob.cal_flags;
+}
+
+static bool settings_read_blob(SettingsBlob &out) {
     const auto *flash_blob =
         reinterpret_cast<const SettingsBlob *>(XIP_BASE + SETTINGS_FLASH_OFFSET);
 
-    if (!settings_blob_valid(*flash_blob))
+    if (settings_blob_valid(*flash_blob)) {
+        out = *flash_blob;
+        return true;
+    }
+
+    const auto *flash_v1 =
+        reinterpret_cast<const SettingsBlobV1 *>(XIP_BASE + SETTINGS_FLASH_OFFSET);
+    if (!settings_blob_v1_valid(*flash_v1))
         return false;
 
-    if (flash_blob->profile_index < 0 ||
-        flash_blob->profile_index >= SETTINGS_PROFILE_COUNT)
+    out = SettingsBlob{};
+    out.magic         = flash_v1->magic;
+    out.version       = SETTINGS_VERSION;
+    out.profile_index = flash_v1->profile_index;
+    for (int i = 0; i < SETTINGS_PROFILE_COUNT; i++)
+        out.vf[i] = flash_v1->vf[i];
+    out.short_zero_delta = -1;
+    out.load100_delta    = -1;
+    out.cal_flags        = 0;
+    out.reserved         = 0;
+    out.crc32            = 0;
+    return true;
+}
+
+bool settings_load(int *profile_index, float vf[SETTINGS_PROFILE_COUNT],
+                   SettingsCalibration *cal) {
+    SettingsBlob blob{};
+    if (!settings_read_blob(blob))
+        return false;
+
+    if (blob.profile_index < 0 ||
+        blob.profile_index >= SETTINGS_PROFILE_COUNT)
         return false;
 
     for (int i = 0; i < SETTINGS_PROFILE_COUNT; i++) {
-        if (!settings_vf_sane(flash_blob->vf[i]))
+        if (!settings_vf_sane(blob.vf[i]))
             return false;
     }
 
-    *profile_index = flash_blob->profile_index;
+    if (!settings_cal_sane(blob))
+        return false;
+
+    *profile_index = blob.profile_index;
     for (int i = 0; i < SETTINGS_PROFILE_COUNT; i++)
-        vf[i] = flash_blob->vf[i];
+        vf[i] = blob.vf[i];
+
+    if (cal)
+        settings_cal_from_blob(blob, *cal);
 
     return true;
 }
 
-bool settings_save(int profile_index, const float vf[SETTINGS_PROFILE_COUNT]) {
+bool settings_save(int profile_index, const float vf[SETTINGS_PROFILE_COUNT],
+                   const SettingsCalibration *cal) {
     if (profile_index < 0 || profile_index >= SETTINGS_PROFILE_COUNT)
         return false;
 
@@ -82,13 +169,27 @@ bool settings_save(int profile_index, const float vf[SETTINGS_PROFILE_COUNT]) {
             return false;
     }
 
+    SettingsCalibration cal_tmp{};
+    settings_cal_defaults(cal_tmp);
+    if (cal)
+        cal_tmp = *cal;
+
+    if (cal_tmp.short_zero_delta < -1 || cal_tmp.short_zero_delta > 3)
+        return false;
+    if (cal_tmp.load100_delta < -1 || cal_tmp.load100_delta > 12)
+        return false;
+
     SettingsBlob blob{};
     blob.magic         = SETTINGS_MAGIC;
     blob.version       = SETTINGS_VERSION;
     blob.profile_index = profile_index;
     for (int i = 0; i < SETTINGS_PROFILE_COUNT; i++)
         blob.vf[i] = vf[i];
-    blob.crc32 = 0;
+    blob.short_zero_delta = cal_tmp.short_zero_delta;
+    blob.load100_delta    = cal_tmp.load100_delta;
+    blob.cal_flags        = cal_tmp.flags;
+    blob.reserved         = 0;
+    blob.crc32            = 0;
     blob.crc32 = settings_crc32(reinterpret_cast<const uint8_t *>(&blob),
                                 sizeof(blob));
 
@@ -123,14 +224,25 @@ SettingsFlashStatus settings_verify_flash() {
     if (flash_blob->magic != SETTINGS_MAGIC)
         return SettingsFlashStatus::BadMagic;
 
+    if (flash_blob->version == 1u) {
+        const auto *flash_v1 =
+            reinterpret_cast<const SettingsBlobV1 *>(XIP_BASE + SETTINGS_FLASH_OFFSET);
+        if (!settings_blob_v1_valid(*flash_v1))
+            return SettingsFlashStatus::BadCrc;
+        if (flash_v1->profile_index < 0 ||
+            flash_v1->profile_index >= SETTINGS_PROFILE_COUNT)
+            return SettingsFlashStatus::BadData;
+        for (int i = 0; i < SETTINGS_PROFILE_COUNT; i++) {
+            if (!settings_vf_sane(flash_v1->vf[i]))
+                return SettingsFlashStatus::BadData;
+        }
+        return SettingsFlashStatus::Ok;
+    }
+
     if (flash_blob->version != SETTINGS_VERSION)
         return SettingsFlashStatus::BadData;
 
-    SettingsBlob tmp = *flash_blob;
-    tmp.crc32        = 0;
-    uint32_t expect  = settings_crc32(reinterpret_cast<const uint8_t *>(&tmp),
-                                      sizeof(tmp));
-    if (flash_blob->crc32 != expect)
+    if (!settings_blob_valid(*flash_blob))
         return SettingsFlashStatus::BadCrc;
 
     if (flash_blob->profile_index < 0 ||
@@ -141,6 +253,9 @@ SettingsFlashStatus settings_verify_flash() {
         if (!settings_vf_sane(flash_blob->vf[i]))
             return SettingsFlashStatus::BadData;
     }
+
+    if (!settings_cal_sane(*flash_blob))
+        return SettingsFlashStatus::BadData;
 
     return SettingsFlashStatus::Ok;
 }

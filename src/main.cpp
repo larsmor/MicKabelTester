@@ -33,6 +33,29 @@ static CableProfile profiles[] = {
 static int g_profile_index = 0;
 static const int PROFILE_COUNT = 4;
 
+static SettingsCalibration g_cal{};
+
+static void cal_apply_to_tdr() {
+    TdrCalibState ts{};
+    ts.short_zero_delta = g_cal.short_zero_delta;
+    ts.load100_delta    = g_cal.load100_delta;
+    ts.short_valid      = (g_cal.flags & SETTINGS_CAL_SHORT_VALID) != 0;
+    ts.load_valid       = (g_cal.flags & SETTINGS_CAL_LOAD_VALID) != 0;
+    tdr_set_calibration(ts);
+}
+
+static void cal_collect_from_tdr() {
+    TdrCalibState ts{};
+    tdr_get_calibration(ts);
+    g_cal.short_zero_delta = ts.short_zero_delta;
+    g_cal.load100_delta    = ts.load100_delta;
+    g_cal.flags            = 0;
+    if (ts.short_valid)
+        g_cal.flags |= SETTINGS_CAL_SHORT_VALID;
+    if (ts.load_valid)
+        g_cal.flags |= SETTINGS_CAL_LOAD_VALID;
+}
+
 static void profiles_collect_vf(float vf[SETTINGS_PROFILE_COUNT]) {
     for (int i = 0; i < PROFILE_COUNT; i++)
         vf[i] = profiles[i].vf;
@@ -46,7 +69,8 @@ static void profiles_apply_vf(const float vf[SETTINGS_PROFILE_COUNT]) {
 static void profiles_save_to_flash() {
     float vf[SETTINGS_PROFILE_COUNT];
     profiles_collect_vf(vf);
-    if (settings_save(g_profile_index, vf))
+    cal_collect_from_tdr();
+    if (settings_save(g_profile_index, vf, &g_cal))
         printf("Settings saved to flash\n");
 }
 
@@ -56,6 +80,10 @@ static void profiles_restore_defaults() {
     profiles[2].vf = 0.78f;
     profiles[3].vf = 0.72f;
     g_profile_index = 0;
+    g_cal.short_zero_delta = -1;
+    g_cal.load100_delta    = -1;
+    g_cal.flags            = 0;
+    cal_apply_to_tdr();
 }
 
 static void flash_status_message(char *line1, size_t n1,
@@ -90,6 +118,7 @@ enum class AppState {
     TdrView,
     MicView,
     MenuProfiles,
+    CalibMenu,
     Calibrate,
     FactoryReset,
     VerifyFlash
@@ -106,7 +135,7 @@ static constexpr int TDR_UI_HOLD_CYCLES = 4;
 static constexpr int TDR_UI_OPEN_HOLD_STREAK = 4;
 static constexpr int TDR_UI_OPEN_HOLD_CYCLES = 40;
 static constexpr int TDR_UI_STRONG_OPEN_HOLD = 60;
-static constexpr int TDR_UI_CABLE_PULSE_MIN = 14;
+static constexpr int TDR_UI_CABLE_PULSE_MIN = 13;
 static constexpr float TDR_UI_OPEN_DIST_LO = 1.5f;
 static constexpr float TDR_UI_OPEN_DIST_HI = 5.0f;
 static constexpr float TDR_UI_OPEN_DIST_MIN = 0.5f;
@@ -145,11 +174,57 @@ static uint8_t tdr_ui_kind(const TdrResult &r) {
 
 static void calib_status_message(char *line1, size_t n1,
                                  char *line2, size_t n2,
-                                 const TdrResult &r, bool vf_ok) {
+                                 TdrCalibType type,
+                                 const TdrResult &r, bool cal_ok) {
     line2[0] = '\0';
 
-    if (vf_ok) {
-        std::snprintf(line1, n1, "Calibration OK");
+    if (cal_ok) {
+        switch (type) {
+        case TdrCalibType::Open:
+            std::snprintf(line1, n1, "Open cal OK");
+            break;
+        case TdrCalibType::Short:
+            std::snprintf(line1, n1, "Short cal OK");
+            std::snprintf(line2, n2, "Zero saved");
+            break;
+        case TdrCalibType::Load100:
+            std::snprintf(line1, n1, "Load cal OK");
+            std::snprintf(line2, n2, "100 ohm saved");
+            break;
+        }
+        return;
+    }
+    if (type == TdrCalibType::Short) {
+        if (r.no_cable || r.weak_signal) {
+            std::snprintf(line1, n1, "No short seen");
+            std::snprintf(line2, n2, "Short pins 5-6");
+            return;
+        }
+        if (!r.is_short) {
+            std::snprintf(line1, n1, "Not short");
+            std::snprintf(line2, n2, "Short pins 5-6");
+            return;
+        }
+        std::snprintf(line1, n1, "Short cal fail");
+        return;
+    }
+    if (type == TdrCalibType::Load100) {
+        if (r.no_cable) {
+            std::snprintf(line1, n1, "No load seen");
+            std::snprintf(line2, n2, "Connect 100 ohm");
+            return;
+        }
+        if (r.is_short) {
+            std::snprintf(line1, n1, "Short not load");
+            std::snprintf(line2, n2, "Use 100 ohm");
+            return;
+        }
+        if (r.weak_signal) {
+            std::snprintf(line1, n1, "Weak reflection");
+            std::snprintf(line2, n2, "Check 100 ohm");
+            return;
+        }
+        std::snprintf(line1, n1, "Load cal fail");
         return;
     }
     if (r.no_cable) {
@@ -213,12 +288,15 @@ int main() {
 
     {
         float loaded_vf[SETTINGS_PROFILE_COUNT];
-        if (settings_load(&g_profile_index, loaded_vf)) {
+        SettingsCalibration loaded_cal{};
+        if (settings_load(&g_profile_index, loaded_vf, &loaded_cal)) {
             profiles_apply_vf(loaded_vf);
+            g_cal = loaded_cal;
             printf("Settings loaded from flash (profile %d)\n", g_profile_index);
         } else {
             printf("Settings: flash empty/invalid, using defaults\n");
         }
+        cal_apply_to_tdr();
     }
 
     AppState state      = AppState::StartupMenu;
@@ -227,7 +305,10 @@ int main() {
     bool     calib_ok     = false;
     static int menu_sel      = 0;
     static int settings_sel  = 0;
+    static int calib_menu_sel = 0;
     static int confirm_sel   = 0;
+
+    static TdrCalibType calib_type = TdrCalibType::Open;
 
     static TdrResult last_r{};
     static char      calib_line1[22];
@@ -298,6 +379,9 @@ int main() {
             const bool have_last_open =
                 s_last_open_dist >= TDR_UI_OPEN_DIST_LO &&
                 s_last_open_dist <= TDR_UI_OPEN_DIST_HI;
+            const bool reject_no_cable_update =
+                r.no_cable && cable_present && have_last_open &&
+                !r.is_short && !hw_short;
             const bool r_no_signal =
                 r.no_cable || (!r.fault_found && !r.weak_signal && !r.unstable);
             const bool force_open_hold =
@@ -340,8 +424,10 @@ int main() {
             } else if (pin_open_display) {
                 if (tdr_ui_meas_open(r))
                     ui_tdr = r;
-            } else if (open_overrides_short || r.consensus_strong || ui_hold <= 0 ||
-                tdr_ui_kind(r) == tdr_ui_kind(ui_tdr)) {
+            } else if (open_overrides_short ||
+                       (r.consensus_strong && !reject_no_cable_update) ||
+                       ui_hold <= 0 ||
+                       tdr_ui_kind(r) == tdr_ui_kind(ui_tdr)) {
                 if (!bogus_open || !tdr_ui_good_open(ui_tdr))
                     ui_tdr = r;
                 ui_hold = TDR_UI_HOLD_CYCLES;
@@ -437,36 +523,89 @@ int main() {
         }
 
         // ----------------------------------------------------
+        // CALIBRATION TYPE MENU
+        // ----------------------------------------------------
+        case AppState::CalibMenu: {
+            if (delta != 0) {
+                if (delta > 0) calib_menu_sel++;
+                else           calib_menu_sel--;
+
+                if (calib_menu_sel < 0) calib_menu_sel = 3;
+                if (calib_menu_sel > 3) calib_menu_sel = 0;
+            }
+
+            ui_draw_calib_menu(calib_menu_sel);
+            input_set_rgb(0, 50, 200);
+
+            if (press) {
+                switch (calib_menu_sel) {
+                case 0:
+                case 1:
+                case 2:
+                    mic_deinit();
+                    tdr_start_for_profile(profiles[g_profile_index]);
+                    calib_type = static_cast<TdrCalibType>(calib_menu_sel);
+                    calib_ref_m  = 3.0f;
+                    calib_done   = false;
+                    calib_ok     = false;
+                    calib_line1[0] = '\0';
+                    calib_line2[0] = '\0';
+                    state = AppState::Calibrate;
+                    break;
+                default:
+                    state = AppState::SettingsMenu;
+                    break;
+                }
+            }
+            break;
+        }
+
+        // ----------------------------------------------------
         // CALIBRATION
         // ----------------------------------------------------
         case AppState::Calibrate: {
 
-            if (!calib_done && delta != 0) {
+            if (!calib_done && calib_type == TdrCalibType::Open && delta != 0) {
                 calib_ref_m += (delta > 0) ? 1.0f : -1.0f;
                 if (calib_ref_m < 1.0f) calib_ref_m = 1.0f;
             }
 
             if (!calib_done && press) {
                 ui_show_progress("Measuring...", 20);
-                TdrResult r = tdr_measure_for_calibrate();
+                TdrResult r = tdr_measure_for_calibrate(calib_type);
 
-                if (!tdr_calibrate_vf_allowed(r)) {
-                    calib_ok   = false;
-                    calib_done = true;
-                }
-                else {
-                    calib_ok   = tdr_apply_calibrate_vf(calib_ref_m, r);
-                    calib_done = true;
+                switch (calib_type) {
+                case TdrCalibType::Open:
+                    if (!tdr_calibrate_vf_allowed(r)) {
+                        calib_ok   = false;
+                        calib_done = true;
+                    } else {
+                        calib_ok   = tdr_apply_calibrate_vf(calib_ref_m, r);
+                        calib_done = true;
 
-                    if (g_profile_index == 3 && calib_ok) {
-                        profiles[3].vf = tdr_get_velocity_factor();
+                        if (g_profile_index == 3 && calib_ok) {
+                            profiles[3].vf = tdr_get_velocity_factor();
+                        }
                     }
-                    if (calib_ok)
-                        profiles_save_to_flash();
+                    break;
+                case TdrCalibType::Short:
+                    calib_ok   = tdr_apply_calibrate_short(r, nullptr);
+                    calib_done = true;
+                    break;
+                case TdrCalibType::Load100:
+                    calib_ok   = tdr_apply_calibrate_load100(r, nullptr);
+                    calib_done = true;
+                    break;
+                }
+
+                if (calib_done && calib_ok) {
+                    cal_collect_from_tdr();
+                    profiles_save_to_flash();
                 }
                 last_r = r;
 #if defined(TDR_DEBUG) || defined(CALIB_DEBUG)
-                tdr_dbg_print_calibrate(r, calib_ok, calib_ref_m);
+                if (calib_type == TdrCalibType::Open)
+                    tdr_dbg_print_calibrate(r, calib_ok, calib_ref_m);
 #endif
             }
             else if (calib_done && press) {
@@ -474,12 +613,12 @@ int main() {
                 calib_done   = false;
                 calib_ok     = false;
                 tdr_deinit();
-                state = AppState::SettingsMenu;
+                state = AppState::CalibMenu;
             }
 
             // LED feedback
             if (calib_done) {
-                if (!last_r.fault_found)
+                if (!last_r.fault_found && calib_type == TdrCalibType::Open)
                     input_set_rgb(255, 255, 0);   // yellow = no cable
                 else if (!calib_ok)
                     input_set_rgb(255, 0, 0);     // red = measurement error
@@ -492,13 +631,14 @@ int main() {
             if (calib_done) {
                 calib_status_message(calib_line1, sizeof(calib_line1),
                                      calib_line2, sizeof(calib_line2),
-                                     last_r, calib_ok);
+                                     calib_type, last_r, calib_ok);
             } else {
                 calib_line1[0] = '\0';
                 calib_line2[0] = '\0';
             }
 
-            ui_draw_calib(calib_ref_m, calib_done, calib_ok,
+            ui_draw_calib(static_cast<int>(calib_type),
+                          calib_ref_m, calib_done, calib_ok,
                           calib_line1, calib_line2);
             break;
         }
@@ -523,17 +663,10 @@ int main() {
                 case 0:
                     state = AppState::MenuProfiles;
                     break;
-                case 1: {
-                    mic_deinit();
-                    tdr_start_for_profile(profiles[g_profile_index]);
-                    state        = AppState::Calibrate;
-                    calib_ref_m  = 3.0f;
-                    calib_done   = false;
-                    calib_ok     = false;
-                    calib_line1[0] = '\0';
-                    calib_line2[0] = '\0';
+                case 1:
+                    calib_menu_sel = 0;
+                    state = AppState::CalibMenu;
                     break;
-                }
                 case 2:
                     confirm_sel = 0;
                     factory_reset_phase = FactoryResetPhase::Confirm;

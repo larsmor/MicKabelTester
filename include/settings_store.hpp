@@ -5,11 +5,22 @@
 // Antal kabelprofiler (matcher main.cpp)
 constexpr int SETTINGS_PROFILE_COUNT = 4;
 
-// Indlæs fra flash. Returnerer false ved første boot / ugyldig data (brug defaults).
-bool settings_load(int *profile_index, float vf[SETTINGS_PROFILE_COUNT]);
+struct SettingsCalibration {
+    int8_t  short_zero_delta; // kalibreret stik-SHORT delta (0-2), -1 = default
+    int8_t  load100_delta;    // kalibreret 100Ω refleksions-delta, -1 = default
+    uint8_t flags;            // bit0 short valid, bit1 load100 valid
+};
 
-// Gem profil-index og alle VF-værdier til flash.
-bool settings_save(int profile_index, const float vf[SETTINGS_PROFILE_COUNT]);
+constexpr uint8_t SETTINGS_CAL_SHORT_VALID  = 0x01u;
+constexpr uint8_t SETTINGS_CAL_LOAD_VALID   = 0x02u;
+
+// Indlæs fra flash. Returnerer false ved første boot / ugyldig data (brug defaults).
+bool settings_load(int *profile_index, float vf[SETTINGS_PROFILE_COUNT],
+                   SettingsCalibration *cal = nullptr);
+
+// Gem profil-index, VF og kalibrering til flash.
+bool settings_save(int profile_index, const float vf[SETTINGS_PROFILE_COUNT],
+                   const SettingsCalibration *cal = nullptr);
 
 enum class SettingsFlashStatus {
     Ok,

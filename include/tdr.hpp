@@ -8,10 +8,17 @@ struct TdrConfig {
 
 // diag ved manglende signal (se tdr_run_hw_diag)
 enum TdrDiag : uint8_t {
-    TDR_DIAG_NONE       = 0,
-    TDR_DIAG_GP23_OK    = 1,  // GP3 følger GP2 → print OK, kabel/stik TDR
-    TDR_DIAG_GP23_OPEN  = 2,  // GP3 reagerer ikke på GP2
-    TDR_DIAG_GP3_STUCK  = 3,
+    TDR_DIAG_NONE         = 0,
+    TDR_DIAG_GP23_OK      = 1,  // GP3 følger GP2 → print OK, kabel/stik TDR
+    TDR_DIAG_GP23_OPEN    = 2,  // GP3 reagerer ikke på GP2
+    TDR_DIAG_GP3_STUCK    = 3,
+    TDR_DIAG_GROUND_FAULT = 4,  // stik 4-5 eller 4-6 (GND til puls/sense, ikke 5-6)
+};
+
+enum class TdrCalibType : uint8_t {
+    Open    = 0,
+    Short   = 1,
+    Load100 = 2,
 };
 
 struct TdrResult {
@@ -41,6 +48,13 @@ struct TdrCalibration {
     int  offset_idx;
 };
 
+struct TdrCalibState {
+    int8_t  short_zero_delta;
+    int8_t  load100_delta;
+    bool    short_valid;
+    bool    load_valid;
+};
+
 void tdr_init(const TdrConfig &cfg);
 void tdr_deinit();
 
@@ -48,13 +62,20 @@ float tdr_get_sample_period_ns();
 void  tdr_set_velocity_factor(float vf);
 float tdr_get_velocity_factor();
 
+void tdr_set_calibration(const TdrCalibState &cal);
+void tdr_get_calibration(TdrCalibState &cal);
+
 TdrResult tdr_measure();
 TdrResult tdr_measure_filtered();
 TdrResult tdr_measure_stable();
-TdrResult tdr_measure_for_calibrate();
+TdrResult tdr_measure_for_calibrate(TdrCalibType type = TdrCalibType::Open);
 bool      tdr_calibrate_measurement_ok(const TdrResult &r);
 bool      tdr_calibrate_vf_allowed(const TdrResult &r);
 bool      tdr_apply_calibrate_vf(float L_ref_m, TdrResult &r);
+bool      tdr_calibrate_short_ok(const TdrResult &r);
+bool      tdr_apply_calibrate_short(const TdrResult &r, int *out_delta);
+bool      tdr_calibrate_load100_ok(const TdrResult &r);
+bool      tdr_apply_calibrate_load100(const TdrResult &r, int *out_delta);
 #if defined(TDR_DEBUG) || defined(CALIB_DEBUG)
 void tdr_dbg_print_calibrate(const TdrResult &r, bool calib_ok, float ref_m);
 #endif

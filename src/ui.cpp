@@ -135,7 +135,12 @@ void ui_draw_tdr_graph(GFX &d,
         else
             d.drawString(72, 0, show.is_short ? "SHORT" : "OPEN", 1);
     } else if (show.no_cable) {
-        d.drawString(0, 0, "No cable", 1);
+        if (show.diag == TDR_DIAG_GROUND_FAULT) {
+            d.drawString(0, 0, "Ground fault", 1);
+            d.drawString(0, 8, "Pin 4-5/6", 1);
+        } else {
+            d.drawString(0, 0, "No cable", 1);
+        }
     } else if (show.weak_signal) {
         d.drawString(0, 0, "Weak signal", 1);
         d.drawString(0, 8, "No reflection", 1);
@@ -297,7 +302,41 @@ void ui_draw_menu(const char *profile_name,
 // ------------------------------------------------------------
 // CALIBRATION
 // ------------------------------------------------------------
-void ui_draw_calib(float ref_len_m,
+void ui_draw_calib_menu(int selection)
+{
+    auto &d = *g_disp;
+    d.clear();
+
+    d.drawString(0, ui_y(0), "Calibration", 1);
+    d.drawString(0, ui_y(1), "Select:", 1);
+
+    const char *items[] = {
+        "Open",
+        "Short",
+        "Load 100 ohm",
+        "Back"
+    };
+
+    const int item_count = 4;
+    const int menu_top = ui_y(2);
+
+    for (int i = 0; i < item_count; i++) {
+        int y = menu_top + i * UI_LINE;
+
+        if (i == selection) {
+            gfx_fillRect(d, 0, y - 1, d.width(), 10, 1);
+            drawStringInverted(d, 4, y, items[i]);
+        } else {
+            d.drawString(4, y, items[i], 1);
+        }
+    }
+
+    ui_draw_battery(battery_get_percent());
+    d.show();
+}
+
+void ui_draw_calib(int calib_type,
+                   float ref_len_m,
                    bool done,
                    bool ok,
                    const char *status_line1,
@@ -308,14 +347,29 @@ void ui_draw_calib(float ref_len_m,
 
     d.drawString(0, ui_y(0), "Calibration", 1);
 
-    char buf[24];
-    std::snprintf(buf, sizeof(buf), "Ref: %.1fm", ref_len_m);
-    d.drawString(0, ui_y(1), buf, 1);
+    const char *type_names[] = { "Open", "Short", "Load 100 ohm" };
+    if (calib_type >= 0 && calib_type <= 2)
+        d.drawString(0, ui_y(1), type_names[calib_type], 1);
 
     if (!done) {
-        d.drawString(0, ui_y(2), "Match cable len", 1);
-        d.drawString(0, ui_y(3), "Press: measure", 1);
-        d.drawString(0, ui_y(4), "Turn: +/-1m Ref", 1);
+        if (calib_type == 0) {
+            char buf[24];
+            std::snprintf(buf, sizeof(buf), "Ref: %.1fm", ref_len_m);
+            d.drawString(0, ui_y(2), buf, 1);
+            d.drawString(0, ui_y(3), "Match cable len", 1);
+            d.drawString(0, ui_y(4), "Turn: +/-1m Ref", 1);
+            d.drawString(0, ui_y(5), "Press: measure", 1);
+        } else if (calib_type == 1) {
+            d.drawString(0, ui_y(2), "No cable", 1);
+            d.drawString(0, ui_y(3), "Short pins 5-6", 1);
+            d.drawString(0, ui_y(4), "At connector", 1);
+            d.drawString(0, ui_y(5), "Press: measure", 1);
+        } else {
+            d.drawString(0, ui_y(2), "No cable", 1);
+            d.drawString(0, ui_y(3), "Connect 100 ohm", 1);
+            d.drawString(0, ui_y(4), "At connector", 1);
+            d.drawString(0, ui_y(5), "Press: measure", 1);
+        }
     } else {
         if (status_line1 && status_line1[0])
             d.drawString(0, ui_y(3), status_line1, 1);

@@ -52,6 +52,10 @@ static uint g_offset;
 static float g_velocity_factor = 0.66f;
 static float g_clkdiv          = 1.0f;
 static float g_calib_zmax_m    = -1.0f;
+static int8_t  g_cal_short_zero = -1;
+static int8_t  g_cal_load_delta = -1;
+static bool    g_cal_short_valid = false;
+static bool    g_cal_load_valid  = false;
 
 struct TdrCalibUnstableCtx {
     int  spread;
@@ -257,7 +261,48 @@ static bool tdr_samples_vary(const uint8_t *samples, int n) {
     return false;
 }
 
+static int tdr_get_short_delta_max() {
+    if (g_cal_short_valid && g_cal_short_zero >= 0)
+        return g_cal_short_zero + 1;
+    return TDR_SHORT_DELTA_MAX;
+}
+
+static bool tdr_short_cal_active(bool for_calibrate, TdrCalibType cal_type) {
+    return for_calibrate && cal_type == TdrCalibType::Short;
+}
+
+static uint32_t tdr_zero_corrected_delta_ns(uint32_t delta_ns) {
+    if (!g_cal_short_valid || g_cal_short_zero < 0)
+        return delta_ns;
+    uint32_t zero_ns =
+        (uint32_t)((float)g_cal_short_zero * g_capture_sample_period_ns);
+    if (delta_ns <= zero_ns)
+        return 0;
+    return delta_ns - zero_ns;
+}
+
+static int tdr_zero_corrected_delta_samples(int delta) {
+    if (delta < 0)
+        delta = 0;
+    if (g_cal_short_valid && g_cal_short_zero >= 0) {
+        delta -= g_cal_short_zero;
+        if (delta < 0)
+            delta = 0;
+    }
+    return delta;
+}
+
+static bool tdr_reflect_matches_load100(int delta) {
+    if (!g_cal_load_valid || g_cal_load_delta < 0)
+        return false;
+    int diff = delta - g_cal_load_delta;
+    if (diff < 0)
+        diff = -diff;
+    return diff <= 1;
+}
+
 static void tdr_fill_distance_ns(TdrResult &r, uint32_t delta_ns) {
+    delta_ns = tdr_zero_corrected_delta_ns(delta_ns);
     float t = (float)delta_ns * 1e-9f;
     const float C = 299792458.0f;
     r.distance_m = (C * g_velocity_factor * t) / 2.0f;
@@ -300,8 +345,7 @@ static void tdr_fill_distance(TdrResult &r, int launch_i, int reflect_i) {
         tdr_fill_distance_ns(r, dt);
     } else {
         int delta = reflect_i - launch_i;
-        if (delta < 0)
-            delta = 0;
+        delta = tdr_zero_corrected_delta_samples(delta);
         tdr_fill_distance_ns(r,
             (uint32_t)((float)delta * g_capture_sample_period_ns));
     }
@@ -343,9 +387,9 @@ static void tdr_fixup_open_distance_scale(TdrResult &r, int launch_i, int reflec
         r.distance_m = TDR_MAX_DISTANCE_M;
 }
 
-// Peak-søgning sample 12-18, delta 2-5 (~3 m åben kabel)
-static int tdr_find_late_open_peak(const uint8_t *samples, int n, int launch_i,
-                                   int &out_g) {
+// Stigende kant sample 12-18, delta 2-5 — uden bred-puls fallback (undgå falsk 3 m ved stik-SHORT)
+static int tdr_find_late_open_peak_strict(const uint8_t *samples, int n,
+                                            int launch_i, int &out_g) {
     if (launch_i < 0)
         return -1;
 
@@ -383,9 +427,24 @@ static int tdr_find_late_open_peak(const uint8_t *samples, int n, int launch_i,
             out_g      = g;
         }
     }
+    return peak_best;
+}
+
+// Peak-søgning sample 12-18, delta 2-5 (~3 m åben kabel)
+static int tdr_find_late_open_peak(const uint8_t *samples, int n, int launch_i,
+                                   int &out_g) {
+    if (launch_i < 0)
+        return -1;
+
+    int peak_best = tdr_find_late_open_peak_strict(samples, n, launch_i, out_g);
+    if (peak_best >= 0)
+        return peak_best;
+
+    const bool wide_cable =
+        tdr_gp3_pulse_width(samples, n) >= TDR_WIDE_CABLE_PULSE_MIN;
 
     // Bred GP3-puls + kun tidlig kant (fx ri_raw=11): brug launch+2..+5 uanset g>0
-    if (peak_best < 0 && wide_cable) {
+    if (wide_cable) {
         int raw_g = 0;
         int raw_i = tdr_find_open_zone_edge(samples, n, launch_i, raw_g);
         int raw_d = (raw_i >= 0) ? (raw_i - launch_i) : 99;
@@ -415,8 +474,10 @@ static bool tdr_apply_shot_late_open_upgrade(TdrResult &r, const uint8_t *sample
         return false;
 
     int li = r.launch_index >= 0 ? r.launch_index : TDR_PULSE_ON;
-    if (tdr_shot_blocks_late_open(samples, n, li))
-        return false;
+    if (pulse_w < TDR_WIDE_CABLE_PULSE_MIN) {
+        if (tdr_shot_blocks_late_open(samples, n, li))
+            return false;
+    }
     int raw_g = 0;
     int raw_i = tdr_find_open_zone_edge(samples, n, li, raw_g);
     if (raw_i < 0 && r.fault_found && r.reflect_index >= 0)
@@ -541,6 +602,9 @@ struct TdrStableCycleCache {
 
 static TdrStableCycleCache g_stable_cycle{};
 
+static bool tdr_shot_cable_end_reflection(const uint8_t *samples, int n,
+                                          int launch_i);
+
 static bool tdr_shot_good_open_delta_dist(const TdrResult &c, int &delta, float &dist_m) {
     if (!c.fault_found || c.is_short || c.launch_index < 0)
         return false;
@@ -586,7 +650,8 @@ static void tdr_apply_open_shot_indices(TdrResult &out) {
     int launch_i = out.launch_index >= 0 ? out.launch_index : TDR_PULSE_ON;
     int zone_g = 0;
     int zone_i = -1;
-    if (!tdr_shot_blocks_late_open(f, n, launch_i)) {
+    if (!tdr_shot_blocks_late_open(f, n, launch_i) ||
+        tdr_shot_cable_end_reflection(f, n, launch_i)) {
         zone_i = tdr_find_preferred_open_reflect(f, n, launch_i, zone_g);
         if (zone_i < 0)
             zone_i = tdr_find_late_open_peak(f, n, launch_i, zone_g);
@@ -678,8 +743,11 @@ static bool tdr_cycle_has_open_evidence(const TdrStableCycleCache &cyc) {
 }
 
 static bool tdr_result_bogus_open_cycle(const TdrResult &r) {
-    if (r.is_short || r.no_cable)
+    if (r.is_short)
         return false;
+    if (r.no_cable)
+        return g_stable_cycle.valid &&
+               tdr_cycle_has_open_evidence(g_stable_cycle);
     if (!r.fault_found)
         return true;
     if (r.reflect_index < 0)
@@ -823,6 +891,11 @@ static void tdr_fixup_stable_result(TdrResult &r) {
         return;
 
     r.vote_pulse_width = (uint8_t)g_stable_cycle.pulse_width_median;
+
+    if (r.no_cable && tdr_cycle_has_open_evidence(g_stable_cycle)) {
+        if (tdr_force_open_from_cycle_evidence(r))
+            return;
+    }
 
     if (r.is_short || g_stable_cycle.hw_short || g_stable_cycle.short_blocks_open)
         return;
@@ -1146,7 +1219,9 @@ static void tdr_calibrate_finalize_unstable(TdrResult &r) {
     }
 #endif
 
-    if (valid_reflect)
+    if (r.is_short)
+        r.unstable = false;
+    else if (valid_reflect)
         r.unstable = false;
     else
         r.unstable = truly_unstable;
@@ -1172,6 +1247,8 @@ static int tdr_abs_grad(int g) {
 
 static bool tdr_gp3_idle_stable();
 static bool tdr_hw_connector_shorted();
+static bool tdr_hw_ground_fault();
+static bool tdr_mic_connector_short();
 static void tdr_filter_majority();
 static void tdr_gpio_sio_begin();
 static void tdr_set_no_signal(TdrResult &r, bool weak);
@@ -1506,6 +1583,19 @@ static int  tdr_find_calibrate_any_edge(const uint8_t *samples, int n,
                                         int launch_i, int &out_g);
 static bool tdr_open_reflection_blocks_short(const uint8_t *samples, int n,
                                              int launch_i);
+static bool tdr_shot_cable_end_reflection(const uint8_t *samples, int n,
+                                          int launch_i);
+static bool tdr_cable_end_short_evidence(float max_zone_dist_m, int median_delta,
+                                         bool hw_short);
+static float tdr_shot_late_refl_distance_m(const uint8_t *samples, int n,
+                                           int launch_i);
+static bool tdr_shot_forbids_connector_short(const uint8_t *samples, int n,
+                                             int launch_i, float zone_dist_m);
+static bool tdr_cycle_forbids_connector_short(float max_zone_dist_m,
+                                              float max_strict_late_m,
+                                              int median_delta);
+static float tdr_shot_strict_late_refl_distance_m(const uint8_t *samples, int n,
+                                                  int launch_i);
 
 // GP3 høj straks ved launch og hele sendepuls (stik 5-6 kort / GP2→GP3)
 static bool tdr_shot_gp3_immediate_follow(const uint8_t *samples, int n,
@@ -1521,7 +1611,7 @@ static bool tdr_shot_gp3_immediate_follow(const uint8_t *samples, int n,
         return false;
 
     int rise_d = tdr_gp3_rise_delta_after_launch(samples, n, launch_i);
-    if (rise_d > TDR_SHORT_DELTA_MAX)
+    if (rise_d > tdr_get_short_delta_max())
         return false;
 
     int pulse_len = g_capture_pulse_off - TDR_PULSE_ON;
@@ -1542,7 +1632,7 @@ static bool tdr_shot_blocks_late_open(const uint8_t *samples, int n,
     if (!tdr_shot_gp3_immediate_follow(samples, n, launch_i))
         return false;
     int rise_d = tdr_gp3_rise_delta_after_launch(samples, n, launch_i);
-    return rise_d <= TDR_SHORT_DELTA_MAX;
+    return rise_d <= tdr_get_short_delta_max();
 }
 
 // Stik 5-6 kortsluttet: GP3 følger GP2 straks og holder hele sendepuls (ikke divider-kobling)
@@ -1557,7 +1647,7 @@ static bool tdr_is_connector_short(const uint8_t *samples, int n, int launch_i,
         return false;
 
     int rise_d = tdr_gp3_rise_delta_after_launch(samples, n, launch_i);
-    if (rise_d > TDR_SHORT_DELTA_MAX)
+    if (rise_d > tdr_get_short_delta_max())
         return false;
 
     int pulse_len = g_capture_pulse_off - TDR_PULSE_ON;
@@ -1647,8 +1737,9 @@ static bool tdr_open_reflection_blocks_short(const uint8_t *samples, int n,
     if (launch_i < 0)
         return false;
 
-    // Stik 5-6 kort: GP3 følger hele sendepuls — svag OPEN-artefakt (fx enkelt delta 4)
-    if (tdr_shot_gp3_immediate_follow(samples, n, launch_i))
+    // GP3 følger puls — kun ignorer OPEN-blok hvis ingen refleksion ved kabelende
+    if (tdr_shot_gp3_immediate_follow(samples, n, launch_i) &&
+        !tdr_shot_cable_end_reflection(samples, n, launch_i))
         return false;
 
     int zone_g = 0;
@@ -1692,6 +1783,86 @@ static bool tdr_has_later_reflection_peak(const uint8_t *samples, int n,
            TDR_OPEN_MIN_QUALITY;
 }
 
+// Refleksion ved kabelende (~3 m) — ikke stik 5-6 kort (0 m)
+static bool tdr_shot_cable_end_reflection(const uint8_t *samples, int n,
+                                          int launch_i) {
+    if (launch_i < 0)
+        return false;
+    if (tdr_has_later_reflection_peak(samples, n, launch_i))
+        return true;
+    if (tdr_shot_reflection_after_quiet(samples, n, launch_i))
+        return true;
+    if (tdr_shot_delayed_open_rise(samples, n, launch_i))
+        return true;
+    if (tdr_shot_launch_refl_rise(samples, n, launch_i))
+        return true;
+    if (tdr_gp3_pulse_width(samples, n) >= TDR_WIDE_CABLE_PULSE_MIN) {
+        int late_g = 0;
+        int late_i = tdr_find_late_open_peak_strict(samples, n, launch_i, late_g);
+        if (late_i >= 0 && (late_i - launch_i) >= TDR_DIST_MIN_DELTA)
+            return true;
+        late_i = tdr_find_late_open_peak(samples, n, launch_i, late_g);
+        if (late_i >= 0 && (late_i - launch_i) >= TDR_DIST_MIN_DELTA)
+            return true;
+    }
+    return false;
+}
+
+static bool tdr_cable_end_short_evidence(float max_zone_dist_m, int median_delta,
+                                         bool hw_short) {
+    if (!hw_short)
+        return false;
+    if (max_zone_dist_m >= TDR_SHORT_BLOCK_ZONE_DIST_M)
+        return true;
+    if (median_delta >= TDR_MEDIAN_OPEN_BLOCK_SHORT_LO)
+        return true;
+    return median_delta >= TDR_TYPICAL_3M_MEDIAN_LO &&
+           median_delta <= TDR_TYPICAL_3M_MEDIAN_HI;
+}
+
+// Sen refleksionsafstand — strict peak, derefter bred-puls fallback (kabelende kort)
+static float tdr_shot_late_refl_distance_m(const uint8_t *samples, int n,
+                                           int launch_i) {
+    if (launch_i < 0)
+        return -1.0f;
+    float dist = tdr_shot_strict_late_refl_distance_m(samples, n, launch_i);
+    int late_g = 0;
+    int late_i = tdr_find_late_open_peak(samples, n, launch_i, late_g);
+    if (late_i < 0)
+        return dist;
+    int delta = late_i - launch_i;
+    if (delta < TDR_DIST_MIN_DELTA)
+        return dist;
+    float d2 = tdr_distance_m_from_indices(launch_i, late_i);
+    if (d2 > dist)
+        return d2;
+    return dist;
+}
+
+static bool tdr_shot_forbids_connector_short(const uint8_t *samples, int n,
+                                             int launch_i, float zone_dist_m) {
+    if (zone_dist_m >= TDR_SHORT_BLOCK_ZONE_DIST_M)
+        return true;
+    if (tdr_shot_late_refl_distance_m(samples, n, launch_i) >=
+        TDR_SHORT_BLOCK_ZONE_DIST_M)
+        return true;
+    if (tdr_shot_cable_end_reflection(samples, n, launch_i))
+        return true;
+    return false;
+}
+
+static bool tdr_cycle_forbids_connector_short(float max_zone_dist_m,
+                                              float max_strict_late_m,
+                                              int median_delta) {
+    if (max_zone_dist_m >= TDR_SHORT_BLOCK_ZONE_DIST_M)
+        return true;
+    if (max_strict_late_m >= TDR_SHORT_BLOCK_ZONE_DIST_M)
+        return true;
+    if (median_delta >= TDR_MEDIAN_OPEN_BLOCK_SHORT_LO)
+        return true;
+    return false;
+}
+
 // Foretræk delta 2-6 (~3 m): launch+2..+10 med afslappet kant; peak 12-20 ved kun d=1
 static int tdr_find_preferred_open_reflect(const uint8_t *samples, int n,
                                            int launch_i, int &out_g) {
@@ -1707,8 +1878,7 @@ static int tdr_find_preferred_open_reflect(const uint8_t *samples, int n,
         int raw_g = 0;
         int raw_i = tdr_find_open_zone_edge(samples, n, launch_i, raw_g);
         int raw_d = (raw_i >= 0) ? (raw_i - launch_i) : 99;
-        if (raw_d <= TDR_SHORT_DELTA_MAX &&
-            !tdr_shot_blocks_late_open(samples, n, launch_i)) {
+        if (raw_d <= TDR_SHORT_DELTA_MAX) {
             int late_g = 0;
             int late_i = tdr_find_late_open_peak(samples, n, launch_i, late_g);
             if (late_i >= 0) {
@@ -1877,7 +2047,11 @@ static int tdr_find_preferred_open_reflect(const uint8_t *samples, int n,
 
 static float tdr_shot_open_zone_distance_m(const uint8_t *samples, int n,
                                            int launch_i) {
-    if (tdr_shot_blocks_late_open(samples, n, launch_i))
+    const bool wide_cable =
+        tdr_gp3_pulse_width(samples, n) >= TDR_WIDE_CABLE_PULSE_MIN;
+    if (tdr_shot_blocks_late_open(samples, n, launch_i) &&
+        !tdr_shot_cable_end_reflection(samples, n, launch_i) &&
+        !wide_cable)
         return -1.0f;
     int zone_g = 0;
     int zone_i = tdr_find_preferred_open_reflect(samples, n, launch_i, zone_g);
@@ -1891,6 +2065,20 @@ static float tdr_shot_open_zone_distance_m(const uint8_t *samples, int n,
     tmp.reflect_index = zone_i;
     tdr_fill_distance(tmp, launch_i, zone_i);
     return tmp.distance_m;
+}
+
+static float tdr_shot_strict_late_refl_distance_m(const uint8_t *samples, int n,
+                                                  int launch_i) {
+    if (launch_i < 0)
+        return -1.0f;
+    int late_g = 0;
+    int late_i = tdr_find_late_open_peak_strict(samples, n, launch_i, late_g);
+    if (late_i < 0)
+        return -1.0f;
+    int delta = late_i - launch_i;
+    if (delta < TDR_DIST_MIN_DELTA)
+        return -1.0f;
+    return tdr_distance_m_from_indices(launch_i, late_i);
 }
 
 static float tdr_consensus_distance_m(const TdrResult *results, int median_delta,
@@ -2187,6 +2375,20 @@ void tdr_set_velocity_factor(float vf) {
 
 float tdr_get_velocity_factor() {
     return g_velocity_factor;
+}
+
+void tdr_set_calibration(const TdrCalibState &cal) {
+    g_cal_short_zero   = cal.short_zero_delta;
+    g_cal_load_delta   = cal.load100_delta;
+    g_cal_short_valid  = cal.short_valid;
+    g_cal_load_valid   = cal.load_valid;
+}
+
+void tdr_get_calibration(TdrCalibState &cal) {
+    cal.short_zero_delta = g_cal_short_zero;
+    cal.load100_delta    = g_cal_load_delta;
+    cal.short_valid      = g_cal_short_valid;
+    cal.load_valid       = g_cal_load_valid;
 }
 
 // ------------------------------------------------------------
@@ -2642,15 +2844,51 @@ static bool tdr_hw_connector_shorted() {
     return hi && !lo;
 }
 
+// Stik 4-5 (GND→puls) eller 4-6 (GND→sense): GP3 stabil lav, følger ikke GP2-puls.
+// Ikke stik 5-6 kort (det giver GP3 høj ved GP2=1). Tomt stik har ofte flydende GP3.
+static bool tdr_hw_ground_fault() {
+    if (!g_tdr_active)
+        return false;
+    if (tdr_hw_connector_shorted())
+        return false;
+    if (tdr_mic_connector_short())
+        return false;
+    if (!tdr_gp3_idle_stable())
+        return false;
+
+    tdr_gpio_sio_begin();
+    gpio_disable_pulls(TDR_IN_PIN);
+
+    gpio_put(TDR_OUT_PIN, 0);
+    busy_wait_us(TDR_DIAG_SETTLE_US);
+    (void)gpio_get(TDR_IN_PIN);
+
+    gpio_put(TDR_OUT_PIN, 1);
+    busy_wait_us(TDR_DIAG_DRIVE_US);
+    bool hi = gpio_get(TDR_IN_PIN);
+    if (!hi) {
+        busy_wait_us(TDR_DIAG_DRIVE_US);
+        hi = gpio_get(TDR_IN_PIN);
+    }
+
+    gpio_put(TDR_OUT_PIN, 0);
+    tdr_restore_pio_pins();
+
+    return !hi;
+}
+
 // ------------------------------------------------------------
 // Gradient-refleksionsdetektor
 // ------------------------------------------------------------
 static TdrResult tdr_detect_reflection(const uint8_t *samples, int n,
-                                       bool for_calibrate = false)
+                                       bool for_calibrate = false,
+                                       TdrCalibType cal_type = TdrCalibType::Open)
 {
     TdrResult r{};
     r.reflect_index = -1;
     r.launch_index  = -1;
+    const bool allow_short =
+        !for_calibrate || tdr_short_cal_active(for_calibrate, cal_type);
 
     if (!tdr_samples_vary(samples, n))
         return r;
@@ -2664,10 +2902,11 @@ static TdrResult tdr_detect_reflection(const uint8_t *samples, int n,
     if (launch_i < 0)
         return r;
 
-    if (!for_calibrate &&
+    if (allow_short &&
         !tdr_open_reflection_blocks_short(samples, n, launch_i)) {
         int short_refl = launch_i;
-        if (tdr_is_connector_short(samples, n, launch_i, &short_refl)) {
+        if (tdr_is_connector_short(samples, n, launch_i, &short_refl) &&
+            !tdr_shot_forbids_connector_short(samples, n, launch_i, -1.0f)) {
             r.fault_found   = true;
             r.launch_index  = launch_i;
             r.reflect_index = short_refl;
@@ -2872,12 +3111,24 @@ static TdrResult tdr_detect_reflection(const uint8_t *samples, int n,
             return r;
         }
         r.unstable = false;
-    } else if (delta <= TDR_SHORT_DELTA_MAX) {
+    } else if (delta <= tdr_get_short_delta_max()) {
         r.is_short = tdr_is_connector_short(samples, n, launch_i, nullptr);
         if (r.is_short)
             r.distance_m = 0.0f;
     } else {
         r.is_short = false;
+    }
+
+    if (!for_calibrate && r.fault_found && !r.is_short) {
+        int d_chk = r.reflect_index - r.launch_index;
+        if (tdr_reflect_matches_load100(d_chk) &&
+            tdr_gp3_pulse_width(samples, n) < TDR_WIDE_CABLE_PULSE_MIN) {
+            r.fault_found   = false;
+            r.reflect_index = -1;
+            r.distance_m    = 0.0f;
+            r.weak_signal   = false;
+            return r;
+        }
     }
 
     if (!for_calibrate && r.fault_found && !r.is_short) {
@@ -2922,7 +3173,8 @@ static TdrResult tdr_detect_reflection(const uint8_t *samples, int n,
             rd = 0;
         if (rd <= TDR_SHORT_DELTA_MAX) {
             int short_refl = launch_i;
-            if (tdr_is_connector_short(samples, n, launch_i, &short_refl)) {
+            if (tdr_is_connector_short(samples, n, launch_i, &short_refl) &&
+                !tdr_shot_forbids_connector_short(samples, n, launch_i, -1.0f)) {
                 r.reflect_index = short_refl;
                 r.launch_index  = launch_i;
                 r.is_short      = true;
@@ -2977,15 +3229,16 @@ static void tdr_filter_majority() {
 // ------------------------------------------------------------
 // Filtered TDR
 // ------------------------------------------------------------
-static TdrResult tdr_measure_filtered_ex(bool for_calibrate) {
+static TdrResult tdr_measure_filtered_ex(bool for_calibrate,
+                                         TdrCalibType cal_type = TdrCalibType::Open) {
     if (for_calibrate)
         tdr_capture_for_calibrate();
     else
         tdr_capture();
     tdr_filter_majority();
-    TdrResult r = tdr_detect_reflection(g_filtered, 128, for_calibrate);
+    TdrResult r = tdr_detect_reflection(g_filtered, 128, for_calibrate, cal_type);
     if (!r.fault_found)
-        r = tdr_detect_reflection(g_samples, 128, for_calibrate);
+        r = tdr_detect_reflection(g_samples, 128, for_calibrate, cal_type);
     if (!r.fault_found) {
         const bool capture_ok = tdr_samples_vary(g_samples, 128);
         if (!for_calibrate || !capture_ok)
@@ -3399,7 +3652,7 @@ static bool tdr_short_consensus_allowed(int median_delta, int max_shot_delta,
                                         float max_zone_dist_m) {
     if (max_zone_dist_m >= TDR_SHORT_BLOCK_ZONE_DIST_M)
         return false;
-    return median_delta <= TDR_SHORT_DELTA_MAX &&
+    return median_delta <= tdr_get_short_delta_max() &&
            max_shot_delta <= TDR_SHORT_MAX_SHOT_DELTA &&
            strong_open_votes == 0;
 }
@@ -3474,6 +3727,10 @@ static bool tdr_shot_pulse_short_sig(const uint8_t *samples, int n, int launch_i
 
 static void tdr_force_shot_connector_short(TdrResult &r, const uint8_t *samples,
                                           int n, int launch_i) {
+    int fn = 128;
+    const uint8_t *f = tdr_get_filtered(fn);
+    if (tdr_shot_forbids_connector_short(f, fn, launch_i, -1.0f))
+        return;
     int short_refl = launch_i;
     if (!tdr_is_connector_short(samples, n, launch_i, &short_refl))
         return;
@@ -3628,7 +3885,8 @@ static TdrResult tdr_pick_open_stable_shot(const TdrResult *results,
     int launch_i = out.launch_index >= 0 ? out.launch_index : TDR_PULSE_ON;
     int zone_g = 0;
     int zone_i = -1;
-    if (!tdr_shot_blocks_late_open(f, n, launch_i)) {
+    if (!tdr_shot_blocks_late_open(f, n, launch_i) ||
+        tdr_shot_cable_end_reflection(f, n, launch_i)) {
         zone_i = tdr_find_preferred_open_reflect(f, n, launch_i, zone_g);
         if (zone_i < 0)
             zone_i = tdr_find_late_open_peak(f, n, launch_i, zone_g);
@@ -3671,47 +3929,132 @@ static TdrResult tdr_pick_open_stable_shot(const TdrResult *results,
     return out;
 }
 
-static void tdr_set_no_signal(TdrResult &r, bool weak) {
-    tdr_clear_fault(r);
-    r.unstable = false;
-    if (weak)
-        r.weak_signal = true;
-    else
-        r.no_cable = true;
+static TdrResult tdr_return_cable_end_short(const TdrResult *results,
+                                            const bool *open_cable_sig,
+                                            const int *shot_q, int tries,
+                                            int open_delta_hi,
+                                            float median_open_dist_m,
+                                            float max_open_zone_dist) {
+    TdrResult out = tdr_pick_open_stable_shot(results, open_cable_sig, shot_q,
+                                              tries, open_delta_hi,
+                                              median_open_dist_m);
+    out.fault_found      = true;
+    out.is_short         = true;
+    out.no_cable         = false;
+    out.weak_signal      = false;
+    out.unstable         = false;
+    out.consensus_strong = true;
+
+    int li = out.launch_index >= 0 ? out.launch_index : TDR_PULSE_ON;
+    int fn = 128;
+    const uint8_t *f = tdr_get_filtered(fn);
+    int zone_g = 0;
+    int zone_i = tdr_find_preferred_open_reflect(f, fn, li, zone_g);
+    if (zone_i < 0)
+        zone_i = tdr_find_late_open_peak(f, fn, li, zone_g);
+    if (zone_i < 0) {
+        int strict_g = 0;
+        zone_i = tdr_find_late_open_peak_strict(f, fn, li, strict_g);
+    }
+    if (zone_i >= 0) {
+        out.launch_index  = li;
+        out.reflect_index = zone_i;
+        tdr_fill_distance(out, li, zone_i);
+    }
+    if (out.distance_m < TDR_OPEN_DISPLAY_DIST_LO) {
+        if (median_open_dist_m >= TDR_OPEN_DISPLAY_DIST_LO)
+            out.distance_m = median_open_dist_m;
+        else if (max_open_zone_dist >= TDR_OPEN_DISPLAY_DIST_LO)
+            out.distance_m = max_open_zone_dist;
+    }
+    if (out.distance_m > TDR_MAX_DISTANCE_M)
+        out.distance_m = TDR_MAX_DISTANCE_M;
+    return out;
 }
 
-static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) {
-    const int tries = 6;
-    const bool hw_connector_short =
-        !for_calibrate && tdr_hw_connector_shorted();
+static void tdr_set_no_signal(TdrResult &r, bool weak) {
+    if (g_stable_cycle.valid && tdr_cycle_has_open_evidence(g_stable_cycle)) {
+        if (tdr_force_open_from_cycle_evidence(r))
+            return;
+    }
+    tdr_clear_fault(r);
+    r.unstable = false;
+    if (weak) {
+        r.weak_signal = true;
+    } else {
+        r.no_cable = true;
+        if (tdr_hw_ground_fault())
+            r.diag = TDR_DIAG_GROUND_FAULT;
+    }
+}
 
-    // HW stik 5-6 kort: SHORT med det samme — ingen OPEN/zmax/late-peak stier
-    if (hw_connector_short) {
-        TdrResult snap = for_calibrate ? tdr_measure_filtered_ex(true)
+static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate,
+                                         TdrCalibType cal_type = TdrCalibType::Open) {
+    const int tries = 6;
+    const bool allow_short =
+        !for_calibrate || tdr_short_cal_active(for_calibrate, cal_type);
+    // hw_continuity: GP3 følger GP2 (stik 5-6 kort eller forbundet kabel)
+    // hw_connector_short (bare): kun tom stik-SHORT — blokerer ikke OPEN ved kabelende
+    const bool hw_continuity =
+        allow_short && tdr_hw_connector_shorted();
+    bool hw_connector_short = hw_continuity;
+
+    // HW stik 5-6 kort: kun 0.0 m når ingen refleksion ved kabelende
+    if (hw_continuity) {
+        TdrResult snap = for_calibrate ? tdr_measure_filtered_ex(true, cal_type)
                                        : tdr_measure_filtered();
-        TdrResult out = snap;
-        out.fault_found      = true;
-        out.is_short         = true;
-        out.no_cable         = false;
-        out.weak_signal      = false;
-        out.unstable         = false;
-        out.consensus_strong = true;
-        out.distance_m       = 0.0f;
-        if (out.launch_index < 0)
-            out.launch_index = TDR_PULSE_ON;
-        if (out.reflect_index < 0)
-            out.reflect_index = out.launch_index;
-        int pw = tdr_gp3_pulse_width(g_samples, 128);
-        tdr_save_stable_cycle(&snap, 1, -1.0f, -1.0f, pw, 0, nullptr,
-                              for_calibrate, true, true);
+        int n = 128;
+        const uint8_t *s = tdr_get_samples(n);
+        int fn = 128;
+        const uint8_t *f = tdr_get_filtered(fn);
+        int launch_i = snap.launch_index >= 0 ? snap.launch_index : TDR_PULSE_ON;
+        float probe_zone = tdr_shot_open_zone_distance_m(f, fn, launch_i);
+        if (probe_zone < 0.0f) {
+            int sd = tdr_shot_reflection_delta(snap, f, fn, launch_i);
+            if (sd >= TDR_MEDIAN_OPEN_BLOCK_SHORT_LO)
+                probe_zone = tdr_distance_m_from_indices(launch_i, launch_i + sd);
+        }
+        const float probe_late =
+            tdr_shot_late_refl_distance_m(f, fn, launch_i);
+        const bool cable_end_probe =
+            tdr_shot_cable_end_reflection(f, fn, launch_i) ||
+            probe_zone >= TDR_SHORT_BLOCK_ZONE_DIST_M ||
+            probe_late >= TDR_SHORT_BLOCK_ZONE_DIST_M;
+
+        if (!cable_end_probe) {
+            TdrResult out = snap;
+            out.fault_found      = true;
+            out.is_short         = true;
+            out.no_cable         = false;
+            out.weak_signal      = false;
+            out.unstable         = false;
+            out.consensus_strong = true;
+            out.distance_m       = 0.0f;
+            if (out.launch_index < 0)
+                out.launch_index = TDR_PULSE_ON;
+            if (out.reflect_index < 0)
+                out.reflect_index = out.launch_index;
+            int pw = tdr_gp3_pulse_width(g_samples, 128);
+            tdr_save_stable_cycle(&snap, 1, -1.0f, -1.0f, pw, 0, nullptr,
+                                  for_calibrate, true, true);
 #if defined(TDR_DEBUG) || defined(CALIB_DEBUG)
-        g_stable_dbg.hw_short             = true;
-        g_stable_dbg.max_open_zone_dist_m = -1.0f;
-        g_stable_dbg.pulse_width_median   = pw;
-        g_stable_dbg.rule                 = "HW";
-        g_stable_dbg.fix_applied          = false;
+            g_stable_dbg.hw_short             = true;
+            g_stable_dbg.max_open_zone_dist_m = -1.0f;
+            g_stable_dbg.pulse_width_median   = pw;
+            g_stable_dbg.rule                 = "HW";
+            g_stable_dbg.fix_applied          = false;
 #endif
-        return out;
+#ifdef TDR_DEBUG
+            TDR_DBG("TDR path=0.0m SHORT rule=HW probe_zone=%.2f probe_late=%.2f\n",
+                    probe_zone, probe_late);
+#endif
+            return out;
+        }
+        hw_connector_short = false;
+#ifdef TDR_DEBUG
+        TDR_DBG("TDR path=cable-end probe (6-shot) probe_zone=%.2f probe_late=%.2f\n",
+                probe_zone, probe_late);
+#endif
     }
 
     TdrResult results[tries];
@@ -3726,9 +4069,11 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
     bool      strong_open_sig[tries];
     bool      gp3_follow[tries];
     float     max_open_zone_dist = -1.0f;
+    float     max_strict_late_dist = -1.0f;
+    int       cable_end_refl_votes = 0;
 
     for (int i = 0; i < tries; i++) {
-        results[i] = for_calibrate ? tdr_measure_filtered_ex(true)
+        results[i] = for_calibrate ? tdr_measure_filtered_ex(true, cal_type)
                                    : tdr_measure_filtered();
         int n = 128;
         const uint8_t *s = tdr_get_samples(n);
@@ -3744,19 +4089,22 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
             int raw_g = 0;
             shot_raw_i[i] = tdr_find_open_zone_edge(f, fn, launch_i, raw_g);
         }
-        if (!for_calibrate && pulse_w[i] >= TDR_WIDE_CABLE_PULSE_MIN &&
-            !gp3_follow[i] &&
-            !tdr_is_connector_short(s, n, launch_i, nullptr)) {
-            int raw_d = (shot_raw_i[i] >= 0) ? (shot_raw_i[i] - launch_i) : 99;
-            if (raw_d <= TDR_SHORT_DELTA_MAX)
-                tdr_apply_shot_late_open_upgrade(results[i], f, fn, pulse_w[i]);
-        }
+        if (!tdr_short_cal_active(for_calibrate, cal_type) &&
+            pulse_w[i] >= TDR_WIDE_CABLE_PULSE_MIN)
+            tdr_apply_shot_late_open_upgrade(results[i], f, fn, pulse_w[i]);
         shot_delta[i] = tdr_shot_reflection_delta(results[i], f, fn, launch_i);
         {
             int pref_g = 0;
             int pref_i = tdr_find_preferred_open_reflect(f, fn, launch_i, pref_g);
             shot_pref_delta[i] =
                 (pref_i >= 0) ? (pref_i - launch_i) : -1;
+            if (shot_pref_delta[i] < TDR_DIST_MIN_DELTA &&
+                pulse_w[i] >= TDR_WIDE_CABLE_PULSE_MIN) {
+                int late_g = 0;
+                int late_i = tdr_find_late_open_peak(f, fn, launch_i, late_g);
+                if (late_i >= 0)
+                    shot_pref_delta[i] = late_i - launch_i;
+            }
             if (shot_pref_delta[i] < TDR_DIST_MIN_DELTA &&
                 results[i].fault_found && results[i].launch_index >= 0) {
                 int ud = results[i].reflect_index - results[i].launch_index;
@@ -3768,6 +4116,21 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
         open_cable_sig[i] = tdr_has_open_cable_reflection(f, fn, launch_i);
         strong_open_sig[i] = tdr_strong_open_cable_sig(f, fn, launch_i);
         float zone_dist = tdr_shot_open_zone_distance_m(f, fn, launch_i);
+        if (zone_dist < 0.0f && shot_delta[i] >= TDR_MEDIAN_OPEN_BLOCK_SHORT_LO)
+            zone_dist = tdr_distance_m_from_indices(launch_i, launch_i + shot_delta[i]);
+        if (zone_dist < 0.0f &&
+            shot_pref_delta[i] >= TDR_MEDIAN_OPEN_BLOCK_SHORT_LO)
+            zone_dist = tdr_distance_m_from_indices(launch_i,
+                                                    launch_i + shot_pref_delta[i]);
+        const float strict_late =
+            tdr_shot_late_refl_distance_m(f, fn, launch_i);
+        if (strict_late > max_strict_late_dist)
+            max_strict_late_dist = strict_late;
+        if (zone_dist < 0.0f && strict_late >= TDR_SHORT_BLOCK_ZONE_DIST_M)
+            zone_dist = strict_late;
+        if (hw_continuity &&
+            tdr_shot_cable_end_reflection(f, fn, launch_i))
+            cable_end_refl_votes++;
         if (zone_dist > max_open_zone_dist)
             max_open_zone_dist = zone_dist;
         if (results[i].fault_found && results[i].launch_index >= 0)
@@ -3778,10 +4141,10 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
         if (zone_dist > TDR_MAX_DISTANCE_M)
             zone_dist = TDR_MAX_DISTANCE_M;
 
-        // Per-shot SHORT: lav delta + bred puls, ingen sen refleksion (eller hw allerede håndteret)
-        if (!for_calibrate && shot_delta[i] < TDR_MEDIAN_OPEN_BLOCK_SHORT_LO &&
+        // Per-shot SHORT: kun stik 5-6 (0 m), ikke kortslutning ved kabelende
+        if (allow_short && shot_delta[i] < TDR_MEDIAN_OPEN_BLOCK_SHORT_LO &&
             !strong_open_sig[i] &&
-            zone_dist < TDR_SHORT_BLOCK_ZONE_DIST_M) {
+            !tdr_shot_forbids_connector_short(f, fn, launch_i, zone_dist)) {
             float shot_dist = zone_dist;
             if (shot_dist < 0.0f && results[i].fault_found &&
                 results[i].launch_index >= 0 && results[i].reflect_index >= 0) {
@@ -3801,8 +4164,9 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
         if (shot_delta[i] >= TDR_MEDIAN_OPEN_BLOCK_SHORT_LO)
             results[i].is_short = false;
 
-        if (!for_calibrate && gp3_follow[i] &&
-            shot_delta[i] <= TDR_SHORT_DELTA_MAX && !strong_open_sig[i]) {
+        if (allow_short && gp3_follow[i] &&
+            shot_delta[i] <= TDR_SHORT_DELTA_MAX && !strong_open_sig[i] &&
+            !tdr_shot_forbids_connector_short(f, fn, launch_i, zone_dist)) {
             results[i].fault_found   = true;
             results[i].is_short      = true;
             results[i].no_cable      = false;
@@ -3839,7 +4203,9 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
         all_delta_sorted[i] = shot_delta[i];
         if (shot_pref_delta[i] >= TDR_RELAXED_OPEN_DELTA_LO &&
             shot_delta[i] <= TDR_SHORT_DELTA_MAX &&
-            !gp3_follow[i])
+            (!gp3_follow[i] ||
+             (hw_continuity &&
+              shot_pref_delta[i] >= TDR_MEDIAN_OPEN_BLOCK_SHORT_LO)))
             all_delta_sorted[i] = shot_pref_delta[i];
     }
     int shot_median_delta = tdr_int_median(all_delta_sorted, tries);
@@ -3869,8 +4235,13 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
         g_calib_zmax_m = max_open_zone_dist;
 
     const bool all_gp3_follow = (gp3_follow_votes == tries);
+    const bool consensus_median_short_early =
+        median_delta <= TDR_SHORT_DELTA_MAX;
     const bool gp3_median_short =
-        median_delta <= TDR_SHORT_DELTA_MAX && all_gp3_follow;
+        consensus_median_short_early && all_gp3_follow;
+    const bool gp3_short_cal_consensus =
+        tdr_short_cal_active(for_calibrate, cal_type) &&
+        gp3_follow_votes >= TDR_STABLE_SHORT_MIN_AGREE;
 
     tdr_save_stable_cycle(results, tries, median_open_dist_m, max_open_zone_dist,
                           width_median_early, median_delta, shot_pref_delta,
@@ -3886,7 +4257,7 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
         shot_raw_i, shot_pref_delta, tries, stable_launch_i);
 
 #if defined(TDR_DEBUG) || defined(CALIB_DEBUG)
-    g_stable_dbg.hw_short             = hw_connector_short;
+    g_stable_dbg.hw_short             = hw_continuity;
     g_stable_dbg.max_open_zone_dist_m = max_open_zone_dist;
     g_stable_dbg.pulse_width_median   = width_median_early;
     g_stable_dbg.rule                 = for_calibrate ? "CAL" : "-";
@@ -3895,8 +4266,38 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
     g_stable_dbg.vf_new               = 0.0f;
 #endif
 
+    float cable_end_zone_dist = max_open_zone_dist;
+    if (max_strict_late_dist > cable_end_zone_dist)
+        cable_end_zone_dist = max_strict_late_dist;
+
+    const bool cable_end_short =
+        !for_calibrate && allow_short && hw_continuity &&
+        (tdr_cable_end_short_evidence(cable_end_zone_dist, median_delta,
+                                      hw_continuity) ||
+         cable_end_refl_votes >= TDR_STABLE_MIN_AGREE ||
+         tdr_cycle_forbids_connector_short(cable_end_zone_dist,
+                                           max_strict_late_dist, median_delta));
+
+    // Kortslutning ved kabelende: HW kontinuitet + refleksion ved ~3 m
+    if (cable_end_short) {
+        TdrResult out = tdr_return_cable_end_short(results, open_cable_sig, shot_q,
+                                                   tries, open_delta_hi,
+                                                   median_open_dist_m,
+                                                   cable_end_zone_dist);
+        tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
+#ifdef TDR_DEBUG
+        g_stable_dbg.rule = "SH3";
+        TDR_DBG("TDR path=cable-end SHORT dist=%.2f zmax=%.2f late=%.2f md=%d\n",
+                out.distance_m, cable_end_zone_dist, max_strict_late_dist,
+                median_delta);
+#endif
+        return out;
+    }
+
     // GP3 følger alle shots + median delta<=1: stik-SHORT før zmax/fallback OPEN
-    if (!for_calibrate && gp3_median_short) {
+    if (allow_short && (gp3_median_short || gp3_short_cal_consensus) &&
+        !tdr_cycle_forbids_connector_short(cable_end_zone_dist,
+                                           max_strict_late_dist, median_delta)) {
         TdrResult out = tdr_return_short_consensus(results, strong_open_sig, tries);
         out.fault_found      = true;
         out.is_short         = true;
@@ -3910,6 +4311,7 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
         tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
 #ifdef TDR_DEBUG
         g_stable_dbg.rule = "SHORT";
+        TDR_DBG("TDR path=0.0m SHORT rule=SHORT gp3_median md=%d\n", median_delta);
 #endif
         return out;
     }
@@ -3917,6 +4319,7 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
     // Bred puls + zmax>=1.5 m: OPEN med zmax-afstand (fx ~3 m efter kalibrering)
     if (!for_calibrate &&
         !gp3_median_short &&
+        !hw_connector_short &&
         max_open_zone_dist >= TDR_OPEN_DISPLAY_DIST_LO &&
         width_median_early >= TDR_WIDE_CABLE_PULSE_MIN) {
         TdrResult out = tdr_pick_open_stable_shot(results, open_cable_sig, shot_q,
@@ -3975,7 +4378,7 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
         max_open_zone_dist < TDR_SHORT_BLOCK_ZONE_DIST_M;
 
     // Afstand + OPEN-konsensus (median 3-5 eller >=4× d>=3) — ikke kun d=2 / zmax alene
-    if (dist_forces_open) {
+    if (dist_forces_open && !cable_end_short) {
         for (int i = 0; i < tries; i++)
             results[i].is_short = false;
         TdrResult out = tdr_pick_open_stable_shot(results, open_cable_sig, shot_q,
@@ -4019,10 +4422,26 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
         (hw_short_contrib || gp3_short_contrib);
 
     if (short_gp3_consensus) {
+        if (hw_continuity &&
+            tdr_cycle_forbids_connector_short(cable_end_zone_dist,
+                                            max_strict_late_dist, median_delta)) {
+            TdrResult out = tdr_return_cable_end_short(results, open_cable_sig, shot_q,
+                                                       tries, open_delta_hi,
+                                                       median_open_dist_m,
+                                                       cable_end_zone_dist);
+            tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
+#ifdef TDR_DEBUG
+            g_stable_dbg.rule = "SH3";
+            TDR_DBG("TDR path=cable-end SHORT (blocked short_gp3) dist=%.2f\n",
+                    out.distance_m);
+#endif
+            return out;
+        }
         TdrResult out = tdr_return_short_consensus(results, strong_open_sig, tries);
         tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
 #ifdef TDR_DEBUG
         g_stable_dbg.rule = "SHORT";
+        TDR_DBG("TDR path=0.0m SHORT rule=SHORT short_gp3 md=%d\n", median_delta);
 #endif
         return out;
     }
@@ -4030,6 +4449,19 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
     if (!for_calibrate && consensus_median_short && dist_allows_short &&
         max_shot_delta <= TDR_SHORT_MAX_SHOT_DELTA &&
         short_shot_votes >= TDR_STABLE_SHORT_MIN_AGREE && short_allowed) {
+        if (hw_continuity &&
+            tdr_cycle_forbids_connector_short(cable_end_zone_dist,
+                                            max_strict_late_dist, median_delta)) {
+            TdrResult out = tdr_return_cable_end_short(results, open_cable_sig, shot_q,
+                                                       tries, open_delta_hi,
+                                                       median_open_dist_m,
+                                                       cable_end_zone_dist);
+            tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
+#ifdef TDR_DEBUG
+            g_stable_dbg.rule = "SH3";
+#endif
+            return out;
+        }
         TdrResult out = tdr_return_short_consensus(results, strong_open_sig, tries);
         tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
 #ifdef TDR_DEBUG
@@ -4068,7 +4500,21 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
             tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
             return out;
         }
-        if (!for_calibrate && short_consensus && dist_allows_short) {
+        if (allow_short && short_consensus &&
+            (dist_allows_short || tdr_short_cal_active(for_calibrate, cal_type))) {
+            if (hw_continuity &&
+                tdr_cycle_forbids_connector_short(cable_end_zone_dist,
+                                                max_strict_late_dist, median_delta)) {
+                TdrResult out = tdr_return_cable_end_short(results, open_cable_sig, shot_q,
+                                                           tries, open_delta_hi,
+                                                           median_open_dist_m,
+                                                           cable_end_zone_dist);
+                tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
+#ifdef TDR_DEBUG
+                g_stable_dbg.rule = "SH3";
+#endif
+                return out;
+            }
             TdrResult out = tdr_return_short_consensus(results, strong_open_sig, tries);
             tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
             return out;
@@ -4083,6 +4529,34 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
         TdrResult r = results[tries - 1];
         if (r.diag == TDR_DIAG_NONE)
             tdr_run_hw_diag(r);
+        if (tdr_short_cal_active(for_calibrate, cal_type)) {
+            if (tdr_hw_connector_shorted()) {
+                r.fault_found      = true;
+                r.is_short         = true;
+                r.no_cable         = false;
+                r.weak_signal      = false;
+                r.unstable         = false;
+                r.consensus_strong = true;
+                r.distance_m       = 0.0f;
+                if (r.launch_index < 0)
+                    r.launch_index = TDR_PULSE_ON;
+                if (r.reflect_index < 0)
+                    r.reflect_index = r.launch_index;
+                tdr_set_vote_debug(r, dbg_md, dbg_so, dbg_sh);
+#if defined(TDR_DEBUG) || defined(CALIB_DEBUG)
+                g_stable_dbg.rule = "HW";
+#endif
+                return r;
+            }
+            if (gp3_short_cal_consensus) {
+                TdrResult out = tdr_return_short_consensus(results, strong_open_sig, tries);
+                tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
+#if defined(TDR_DEBUG) || defined(CALIB_DEBUG)
+                g_stable_dbg.rule = "SHORT";
+#endif
+                return out;
+            }
+        }
         if (!for_calibrate && no_cable_votes >= TDR_STABLE_NO_CABLE_MIN_AGREE) {
             if (pulse_cable_shape && any_post_edges) {
                 TdrResult out = tdr_pick_open_stable_shot(results, open_cable_sig,
@@ -4247,7 +4721,8 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
         return out;
     }
 
-    if (!for_calibrate && short_consensus && dist_allows_short) {
+    if (allow_short && short_consensus &&
+        (dist_allows_short || tdr_short_cal_active(for_calibrate, cal_type))) {
         TdrResult out = tdr_return_short_consensus(results, strong_open_sig, tries);
         tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
         return out;
@@ -4258,6 +4733,16 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
         TdrResult out = tdr_pick_open_stable_shot(results, open_cable_sig, shot_q,
                                                 tries, open_delta_hi, median_open_dist_m);
         tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
+        return out;
+    }
+
+    if (tdr_short_cal_active(for_calibrate, cal_type) &&
+        gp3_short_cal_consensus) {
+        TdrResult out = tdr_return_short_consensus(results, strong_open_sig, tries);
+        tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
+#if defined(TDR_DEBUG) || defined(CALIB_DEBUG)
+        g_stable_dbg.rule = "SHORT";
+#endif
         return out;
     }
 
@@ -4345,6 +4830,12 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
     }
 
     if (open_band && weak_reflection) {
+        if (tdr_short_cal_active(for_calibrate, cal_type) &&
+            (gp3_short_cal_consensus || tdr_hw_connector_shorted())) {
+            TdrResult out = tdr_return_short_consensus(results, strong_open_sig, tries);
+            tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
+            return out;
+        }
         if (!for_calibrate &&
             (max_open_zone_dist >= TDR_DIST_FORCE_OPEN_M ||
              strong_open_votes >= TDR_STABLE_MIN_AGREE))
@@ -4356,6 +4847,12 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
 
     // Aldrig OPEN+afstand ved kort/ustabil puls eller ustabil delta
     if (open_band && pulse_bad) {
+        if (tdr_short_cal_active(for_calibrate, cal_type) &&
+            (gp3_short_cal_consensus || tdr_hw_connector_shorted())) {
+            TdrResult out = tdr_return_short_consensus(results, strong_open_sig, tries);
+            tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
+            return out;
+        }
         if (pulse_cable_shape && any_post_edges) {
             TdrResult out = tdr_pick_open_stable_shot(results, open_cable_sig, shot_q,
                                                       tries, open_delta_hi, median_open_dist_m);
@@ -4385,6 +4882,12 @@ static TdrResult tdr_measure_stable_impl(int open_delta_hi, bool for_calibrate) 
     }
 
     if (open_band) {
+        if (tdr_short_cal_active(for_calibrate, cal_type) &&
+            (gp3_short_cal_consensus || tdr_hw_connector_shorted())) {
+            TdrResult out = tdr_return_short_consensus(results, strong_open_sig, tries);
+            tdr_set_vote_debug(out, dbg_md, dbg_so, dbg_sh);
+            return out;
+        }
         if (pulse_cable_shape && any_post_edges) {
             TdrResult out = tdr_pick_open_stable_shot(results, open_cable_sig, shot_q,
                                                       tries, open_delta_hi, median_open_dist_m);
@@ -4728,15 +5231,66 @@ bool tdr_apply_calibrate_vf(float L_ref_m, TdrResult &r) {
     return meas_ok && (dist_ok || zmax_ok);
 }
 
-TdrResult tdr_measure_for_calibrate() {
+bool tdr_calibrate_short_ok(const TdrResult &r) {
+    if (r.no_cable || r.weak_signal || r.unstable)
+        return false;
+    if (!r.fault_found || r.launch_index < 0)
+        return false;
+    if (!r.is_short)
+        return false;
+    int delta = r.reflect_index - r.launch_index;
+    if (delta < 0)
+        delta = 0;
+    return delta <= 3;
+}
+
+bool tdr_apply_calibrate_short(const TdrResult &r, int *out_delta) {
+    if (!tdr_calibrate_short_ok(r))
+        return false;
+
+    int delta = 0;
+    if (r.reflect_index >= r.launch_index)
+        delta = r.reflect_index - r.launch_index;
+
+    g_cal_short_zero  = (int8_t)delta;
+    g_cal_short_valid = true;
+    if (out_delta)
+        *out_delta = delta;
+    return true;
+}
+
+bool tdr_calibrate_load100_ok(const TdrResult &r) {
+    if (r.no_cable || r.weak_signal || r.unstable || r.is_short)
+        return false;
+    if (!r.fault_found || r.reflect_index <= 0 || r.launch_index < 0)
+        return false;
+    int delta = r.reflect_index - r.launch_index;
+    if (delta < TDR_OPEN_DELTA_LO || delta > TDR_CALIBRATE_OPEN_DELTA_HI)
+        return false;
+    return true;
+}
+
+bool tdr_apply_calibrate_load100(const TdrResult &r, int *out_delta) {
+    if (!tdr_calibrate_load100_ok(r))
+        return false;
+
+    int delta = r.reflect_index - r.launch_index;
+    g_cal_load_delta = (int8_t)delta;
+    g_cal_load_valid = true;
+    if (out_delta)
+        *out_delta = delta;
+    return true;
+}
+
+TdrResult tdr_measure_for_calibrate(TdrCalibType type) {
     sleep_ms(TDR_CALIBRATE_SETTLE_MS);
     g_calib_zmax_m = -1.0f;
     std::memset(&g_calib_unst, 0, sizeof(g_calib_unst));
 #if defined(TDR_DEBUG) || defined(CALIB_DEBUG)
     g_calib_unst_reason = nullptr;
 #endif
-    // Calibrate-path: bredere OPEN-bånd, ingen falsk SHORT fra gradient alene
-    TdrResult r = tdr_measure_stable_impl(TDR_CALIBRATE_OPEN_DELTA_HI, true);
+    // Calibrate-path: bredere OPEN-bånd; SHORT-cal genbruger stik-SHORT-detektion
+    TdrResult r = tdr_measure_stable_impl(TDR_CALIBRATE_OPEN_DELTA_HI, true, type);
     tdr_fixup_calibrate_result(r);
     tdr_calibrate_finalize_unstable(r);
     return r;
@@ -4900,6 +5454,20 @@ bool tdr_vote_logic_selftest() {
     wav[launch + 3] = 1;
     ok = ok && !tdr_shot_gp3_immediate_follow(wav, 128, launch);
     ok = ok && tdr_shot_reflection_after_quiet(wav, 128, launch);
+    ok = ok && tdr_shot_cable_end_reflection(wav, 128, launch);
+    ok = ok && !tdr_cable_end_short_evidence(-1.0f, TDR_TYPICAL_3M_MEDIAN_LO, false);
+    ok = ok && tdr_cable_end_short_evidence(3.0f, 0, true);
+
+    // GP3 følger + stigende kant ~3 m (kortslutning ved kabelende)
+    tdr_selftest_fill_short(wav, 128, launch);
+    wav[launch + 2] = 0;
+    if (launch + 3 < 128)
+        wav[launch + 3] = 1;
+    ok = ok && tdr_shot_late_refl_distance_m(wav, 128, launch) >=
+                 TDR_SHORT_BLOCK_ZONE_DIST_M;
+    ok = ok && tdr_shot_strict_late_refl_distance_m(wav, 128, launch) >=
+                 TDR_SHORT_BLOCK_ZONE_DIST_M;
+    ok = ok && tdr_cable_end_short_evidence(TDR_SHORT_BLOCK_ZONE_DIST_M, 0, true);
 
     return ok;
 }
